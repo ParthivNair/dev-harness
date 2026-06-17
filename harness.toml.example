@@ -1,0 +1,56 @@
+# Instance config TEMPLATE. Copy to `harness.toml` and edit per machine.
+#
+# This file describes ONE install. The same engine runs on every machine; what
+# differs is this file (identity + which repos this machine knows about) and the
+# local environment. Each install acts only on projects whose `owner_instance`
+# matches `instance.instance_id`.
+#
+# The GitHub token is NEVER stored here. Export it instead:
+#     PowerShell:  $env:HARNESS_GITHUB_TOKEN = "github_pat_..."
+#     bash/zsh:    export HARNESS_GITHUB_TOKEN="github_pat_..."
+# Use a fine-grained PAT with: Issues=RW, Pull requests=RW, Metadata=R, Contents=RW.
+schema_version = 1
+
+[instance]
+instance_id = "win-desktop"          # e.g. "win-desktop" / "mac-laptop". MUST be unique per machine.
+display_name = "Parthiv Windows PC"
+platform = "windows"                 # windows | macos | linux — informational only
+
+[github]
+account = "your-github-username"
+repo = "your-github-username/dev-harness-coordination"  # the coordination repo (issues/PRs)
+api_base = "https://api.github.com"
+use_in_memory_fake = false           # set true to run offline with the in-memory GitHub fake
+
+[state_store]
+backend = "json"
+root = ".harness"
+
+[notifier]
+selection = "file"
+log_path = ".harness/notifications.log"
+inbox = ".harness/inbox"
+
+[autonomy]
+run_tests = "autonomous"
+open_draft_pr = "autonomous"
+file_issue = "autonomous"
+set_labels = "autonomous"
+assign_issue = "autonomous"
+mark_pr_ready = "gated"
+dependency_change = "gated"
+schema_change = "gated"
+merge_to_main = "forbidden"
+force_push = "forbidden"
+
+[circuit_breakers]
+max_iterations = 8
+spend_ceiling_usd = 5.0
+spend_is_hard_stop = true
+
+# Register each managed project as a pointer to where its repo sits on THIS disk.
+# The project's own config (owner, build/test commands, prompts) lives in that repo.
+[[projects]]
+id = "macdaw"
+path = "D:/dev/macdaw"
+# config_file = "harness.project.toml"   # optional override of the discovered filename

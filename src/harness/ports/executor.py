@@ -1,0 +1,52 @@
+"""Executor port: runs the actual work and is the ONLY home of platform specifics.
+
+It invokes Claude Code on a task and runs the project's build/test commands by
+shelling out to the local toolchain. The engine sees only this Protocol and the
+result dataclasses; it never branches on the OS.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Optional, Protocol, runtime_checkable
+
+# Avoid a hard import cycle at type-check time; ProjectConfig is only used for typing.
+from harness.config.models import ProjectConfig
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_s: float
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0
+
+
+@dataclass(frozen=True)
+class ClaudeResult:
+    result_text: str
+    session_id: Optional[str]
+    total_cost_usd: float  # feeds the spend circuit breaker
+    input_tokens: int = 0
+    output_tokens: int = 0
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class Executor(Protocol):
+    def run_claude_task(
+        self,
+        *,
+        project: ProjectConfig,
+        prompt: str,
+        json_schema: Optional[dict[str, Any]] = None,
+    ) -> ClaudeResult:
+        """Invoke Claude Code non-interactively; return its result + cost."""
+
+    def run_build(self, *, project: ProjectConfig) -> CommandResult: ...
+
+    def run_test(self, *, project: ProjectConfig) -> CommandResult: ...

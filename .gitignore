@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Virtual envs
+.venv/
+
+# Secrets
+.env
+
+# Runtime state (durable run records, notifier inbox, artifacts) at the repo root.
+# Anchored so a managed project's own .harness/ (prompts) is NOT ignored — those
+# live with the repo on purpose. Kept local per-machine; the cross-machine
+# substrate is GitHub, not this dir.
+/.harness/

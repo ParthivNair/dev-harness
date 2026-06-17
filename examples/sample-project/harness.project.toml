@@ -1,0 +1,28 @@
+# Per-project config. In a real project this lives at the ROOT OF THE MANAGED REPO,
+# version-controlled, so any machine that checks out the repo reads the identical
+# config. Here it sits under examples/ purely to make the demo self-contained.
+schema_version = 1
+
+[project]
+id = "sample"
+display_name = "Sample Project"
+repo = "parthivnair1/sample-project"
+owner_instance = "this-machine"      # only the install with this instance_id acts autonomously
+description = "A self-contained sample project that drives the Milestone 1 demo loop."
+
+[commands]
+# Shelled out with shell=False. The demo uses the EchoExecutor, so these are not
+# actually invoked in M1 — they show the shape the SubprocessExecutor would run.
+build = ["python", "-c", "print('sample build ok')"]
+test = ["python", "-c", "print('sample tests passed')"]
+cwd = "."
+
+[prompts]
+root = ".harness/prompts"
+dev_task = ".harness/prompts/dev_task.md"
+
+[claude]
+model = "claude-opus-4-8"
+permission_mode = "acceptEdits"
+allowed_tools = ["Read", "Edit"]
+disallowed_tools = ["Bash(git push:*)"]   # belt-and-suspenders alongside the structural guard
