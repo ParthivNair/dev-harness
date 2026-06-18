@@ -7,8 +7,9 @@ A **headless, portable engine that orchestrates AI-assisted development across m
 > bounded **architecture-review loop**, the **GitHub-native coordination** (Issues = queue,
 > labels = state, an owner label = a lease), the weighted **multi-project scheduler**
 > (`harness tick`/`watch`) that diverts attention across repos, and a **Discord** notifier +
-> bridge bot. The harness is registered as a managed project of itself (dogfooding). Remaining
-> follow-ups (SQLite store, GitHub Actions wiring, a GUI) are listed at the end.
+> bridge bot. The harness is registered as a managed project of itself (dogfooding). A local
+> observer **dashboard** (`harness ui`) watches it all work. Remaining follow-ups (SQLite store,
+> GitHub Actions wiring, the parallel agent sweep) are listed at the end.
 
 ## Why this exists
 
@@ -18,7 +19,7 @@ That moment is the **VerificationGate**, and it is the heart of the design.
 
 ## Architecture
 
-Hexagonal (ports & adapters). The engine depends only on **ports** (`typing.Protocol` interfaces); concrete **adapters** implement them; one **composition root** (`src/harness/cli/main.py`) wires them together. Platform-specifics live only in per-project config and the local `Executor` — never as `if platform == ...` in the engine.
+Hexagonal (ports & adapters). The engine depends only on **ports** (`typing.Protocol` interfaces); concrete **adapters** implement them; one **composition root** (`src/harness/container.py`) wires them together. The CLI (`src/harness/cli/main.py`) and the web dashboard (`src/harness/web/`) are both *driving* surfaces over that root, and both delegate to the shared use-cases in `src/harness/operations.py` so engine logic lives in exactly one place. Platform-specifics live only in per-project config and the local `Executor` — never as `if platform == ...` in the engine.
 
 ```
 src/harness/
@@ -91,6 +92,18 @@ uv run harness list-runs
 
 To run the whole gate interactively in one process instead, use `--notifier console`.
 
+### The observer dashboard (`harness ui`)
+
+A local web cockpit to watch agents work: a **minimized overview** (one compact line per active run — project, current step, iteration, spend, with verification gates highlighted) that **expands** to per-run detail (step timeline, Claude output, build/test logs, breakers). It can answer gates and start/abort runs from the page. Optional — needs the `web` extra.
+
+```bash
+uv sync --extra web
+uv run harness ui                 # serves http://127.0.0.1:8765 and opens a browser
+uv run harness ui --no-browser    # or set [ui] in harness.toml (enabled/host/port/allow_actions)
+```
+
+It reads the same durable run state the CLI does (no separate source of truth) and routes every action through the same use-cases. It binds **127.0.0.1 only** — the action surface mutates engine state, so it must never be network-exposed; set `[ui].allow_actions = false` for a read-only viewer.
+
 ## Configuration
 
 Two levels, two files (see `harness.toml.example` and `examples/sample-project/`):
@@ -162,4 +175,5 @@ Each machine runs its own stack and coordinates via GitHub:
 - GitHub **Actions / branch-protection** wiring and a stale-lease reconciler.
 - A **SQLite** `RunStore`; cross-process locking / CAS on run records.
 - Artifact upload to Discord (multipart) and per-project gate channels.
-- Sketch → Figma, and any **cockpit GUI**.
+- The **agent sweep**: one planner reads all queued issues, produces a cross-cutting plan, and fans out parallel dev_task agents in isolated git worktrees (the observer dashboard above is the cockpit for watching it).
+- Sketch → Figma.

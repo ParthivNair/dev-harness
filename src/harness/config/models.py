@@ -83,6 +83,21 @@ class SchedulingConfig(BaseModel):
     default_weight: float = 1.0
 
 
+class UIConfig(BaseModel):
+    """The local observer dashboard (``harness ui``). Off by default; it reads the
+    durable run state and — unless ``allow_actions`` is false — can answer gates and
+    start/abort runs. It binds ``127.0.0.1`` ONLY: the action surface mutates engine
+    state, so the dashboard must never be exposed on the network."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"          # localhost only — do not bind 0.0.0.0
+    port: int = 8765
+    poll_interval_ms: int = 1500     # how often the page refreshes the overview
+    allow_actions: bool = True       # false => read-only viewer (no answer/start/abort)
+    open_browser: bool = True        # auto-open the browser when `harness ui` starts
+    board_ttl_seconds: int = 20      # cache for GitHub-derived board reads
+
+
 class DiscordConfig(BaseModel):
     """Discord routing — channel/guild IDs are config (NOT secret); the bot token
     is injected from ``DISCORD_BOT_TOKEN`` in the environment, never from TOML."""
@@ -115,6 +130,7 @@ class HarnessConfig(BaseModel):
     circuit_breakers: CircuitBreakers = Field(default_factory=CircuitBreakers)
     scheduling: SchedulingConfig = Field(default_factory=SchedulingConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    ui: UIConfig = Field(default_factory=UIConfig)
     projects: list[ProjectPointer] = Field(default_factory=list)
 
 

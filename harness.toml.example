@@ -70,6 +70,19 @@ alerts_channel_id = "000000000000000000"    # #alerts (breaker trips, failures)
 runs_channel_id = "000000000000000000"      # #runs (lifecycle), optional
 poll_after_answer = true
 
+# The local observer dashboard (`harness ui`). A minimized overview of every agent
+# that expands to per-run detail; can answer gates and start/abort runs. Binds
+# 127.0.0.1 ONLY (never expose it — the actions mutate engine state). Needs the
+# `web` extra: `uv sync --extra web`.
+[ui]
+enabled = false
+host = "127.0.0.1"
+port = 8765
+poll_interval_ms = 1500
+allow_actions = true                 # false => read-only viewer (no answer/start/abort)
+open_browser = true
+board_ttl_seconds = 20               # cache for GitHub-derived board reads
+
 # Register each managed project as a pointer to where its repo sits on THIS disk.
 # The project's own config (owner, build/test commands, prompts) lives in that repo.
 [[projects]]
