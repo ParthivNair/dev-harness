@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>dev-harness</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo">▣</span>
+      <span class="title">dev-harness</span>
+      <span id="instance" class="muted"></span>
+    </div>
+    <div id="stats" class="stats">
+      <div class="stat"><span class="num" id="stat-active">0</span><span class="lbl">active</span></div>
+      <div class="stat gate"><span class="num" id="stat-gates">0</span><span class="lbl">gates</span></div>
+      <div class="stat"><span class="num" id="stat-queued">–</span><span class="lbl">queued</span></div>
+      <div class="stat spend">
+        <div class="spendbar"><div id="spend-fill" class="spendfill"></div></div>
+        <span class="lbl" id="spend-label">$0 / $0</span>
+      </div>
+    </div>
+    <div class="actions" id="topactions">
+      <button id="btn-start" class="btn" hidden>+ start</button>
+      <button id="btn-tick" class="btn" hidden>tick now</button>
+      <span id="conn" class="conn" title="connection">●</span>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Working now</h2>
+      <div id="active-list" class="runlist"></div>
+      <p id="active-empty" class="empty">No agents working. Start a run, or tick the scheduler.</p>
+    </section>
+
+    <section>
+      <h2 class="collapsible" id="recent-toggle">Recent <span class="muted" id="recent-count"></span></h2>
+      <div id="recent-list" class="runlist dim"></div>
+    </section>
+
+    <section>
+      <h2 class="collapsible" id="board-toggle">Board</h2>
+      <div id="board" class="board"></div>
+    </section>
+  </main>
+
+  <!-- Detail drawer -->
+  <div id="overlay" class="overlay" hidden></div>
+  <aside id="drawer" class="drawer" hidden>
+    <div class="drawer-head">
+      <div>
+        <div id="d-title" class="d-title"></div>
+        <div id="d-sub" class="muted small"></div>
+      </div>
+      <button id="d-close" class="btn ghost">✕</button>
+    </div>
+    <div id="d-gate" class="gatebox" hidden></div>
+    <div id="d-body" class="d-body"></div>
+  </aside>
+
+  <!-- Start-run dialog -->
+  <div id="start-overlay" class="overlay" hidden></div>
+  <div id="start-dialog" class="dialog" hidden>
+    <h3>Start a run</h3>
+    <label>Loop
+      <select id="start-loop">
+        <option value="demo">demo</option>
+        <option value="dev_task">dev_task</option>
+        <option value="arch_review">arch_review</option>
+      </select>
+    </label>
+    <label>Project <input id="start-project" type="text" placeholder="project id" /></label>
+    <label>Issue # <input id="start-issue" type="number" placeholder="(dev_task: blank = next queued)" /></label>
+    <div id="start-error" class="err" hidden></div>
+    <div class="dialog-actions">
+      <button id="start-cancel" class="btn ghost">cancel</button>
+      <button id="start-go" class="btn primary">start</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
