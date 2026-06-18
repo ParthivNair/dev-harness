@@ -14,9 +14,11 @@ from typing import Optional
 
 import typer
 
+from harness.application import coordination as co
 from harness.application.action_guard import ActionGuard
 from harness.application.loop_runner import LoopDefinition, LoopRunner
 from harness.application.ownership import owns
+from harness.application.scheduler import Scheduler, TickReport
 from harness.adapters.executor.echo import EchoExecutor
 from harness.adapters.executor.subprocess_executor import SubprocessExecutor
 from harness.adapters.github.fake import InMemoryGitHub
@@ -28,7 +30,9 @@ from harness.adapters.state.json_store import AtomicJsonRunStore
 from harness.config.loader import find_config, load_harness_config, resolve_under
 from harness.config.models import HarnessConfig, ProjectConfig
 from harness.domain.models import BreakerState, RunStatus, VerificationResponse
+from harness.loops.arch_review import build_arch_review_loop
 from harness.loops.demo import build_demo_loop
+from harness.loops.dev_task import build_dev_loop
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
 from harness.ports.notifier import Notifier
@@ -63,6 +67,26 @@ def build_container(
     selection = notifier_override or cfg.notifier.selection
     if selection == "console":
         notifier: Notifier = ConsoleNotifier()
+    elif selection == "discord":
+        file_n = FileNotifier(
+            resolve_under(base_dir, cfg.notifier.inbox),
+            log_path=resolve_under(base_dir, cfg.notifier.log_path),
+        )
+        if cfg.discord.enabled and cfg.discord.token and cfg.discord.gates_channel_id:
+            from harness.adapters.notifier.discord import DiscordNotifier, DiscordRestPoster
+
+            notifier = DiscordNotifier(
+                file_n,
+                poster=DiscordRestPoster(token=cfg.discord.token),
+                gates_channel_id=cfg.discord.gates_channel_id,
+            )
+        else:
+            typer.echo(
+                "notifier=discord but discord is disabled / missing token or channel; "
+                "using the file notifier (gates still durable, answer via CLI/bot)",
+                err=True,
+            )
+            notifier = file_n
     else:
         notifier = FileNotifier(
             resolve_under(base_dir, cfg.notifier.inbox),
@@ -92,6 +116,13 @@ def build_container(
     )
 
 
+def _project_root(c: Container, project_id: str) -> Path:
+    for p in c.cfg.projects:
+        if p.id == project_id:
+            return resolve_under(c.base_dir, p.path)
+    raise KeyError(project_id)
+
+
 def _build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig]) -> LoopRunner:
     if loop_name == "demo":
         if project is None:
@@ -101,9 +132,62 @@ def _build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig]
             artifacts_dir=c.store.root / "artifacts",
             project=project,
         )
+    elif loop_name == "dev_task":
+        if project is None:
+            raise typer.BadParameter("the dev_task loop needs a project")
+        loop = build_dev_loop(
+            executor=c.executor,
+            github=c.github,
+            guard=c.guard,
+            project=project,
+            instance_id=c.cfg.instance.instance_id,
+            project_root=_project_root(c, project.id),
+            artifacts_dir=c.store.root / "artifacts",
+        )
+    elif loop_name == "arch_review":
+        if project is None:
+            raise typer.BadParameter("the arch_review loop needs a project")
+        loop = build_arch_review_loop(
+            executor=c.executor,
+            github=c.github,
+            guard=c.guard,
+            project=project,
+            project_root=_project_root(c, project.id),
+        )
     else:
-        raise typer.BadParameter(f"unknown loop '{loop_name}' (Milestone 1 ships only 'demo')")
+        raise typer.BadParameter(
+            f"unknown loop '{loop_name}' (try 'demo', 'dev_task', or 'arch_review')"
+        )
     return LoopRunner(loop, c.store, c.notifier)
+
+
+def _mark_blocked_if_aborted(c: Container, run_id: str, status: RunStatus) -> None:
+    if status is RunStatus.ABORTED:
+        co.block_dev_issue_if_aborted(c.github, record=c.store.load(run_id), status=status)
+
+
+def _build_scheduler(c: Container) -> Scheduler:
+    return Scheduler(
+        cfg=c.cfg,
+        store=c.store,
+        registry=c.registry,
+        github=c.github,
+        notifier=c.notifier,
+        runner_factory=lambda loop_name, project: _build_runner(c, loop_name, project),
+        breakers_factory=lambda project: _breakers_for(c.cfg, project),
+        ledger_path=c.store.root / "scheduler.json",
+    )
+
+
+def _echo_tick(report: TickReport) -> None:
+    for rid, status in report.resumed:
+        typer.echo(f"resumed {rid} -> {status}")
+    for pid, rid, status in report.started:
+        typer.echo(f"started {pid} {rid} -> {status}")
+    note = "  (HALTED: spend ceiling reached)" if report.halted_for_spend else ""
+    typer.echo(f"window spend: ${report.window_spend_usd:.2f}{note}")
+    if not report.resumed and not report.started:
+        typer.echo("nothing to do")
 
 
 def _breakers_for(cfg: HarnessConfig, project: ProjectConfig) -> BreakerState:
@@ -147,10 +231,13 @@ def projects(config: Optional[Path] = CONFIG_OPT) -> None:
 
 @app.command()
 def run(
-    loop: str = typer.Argument("demo", help="Loop name (M1: 'demo')."),
+    loop: str = typer.Argument("demo", help="Loop name: 'demo' or 'dev_task'."),
     project: str = typer.Argument(..., help="Registered project id."),
     config: Optional[Path] = CONFIG_OPT,
     notifier: Optional[str] = typer.Option(None, help="Override notifier: 'file' or 'console'."),
+    issue: Optional[int] = typer.Option(
+        None, "--issue", help="dev_task: issue number to work (else claim the next queued)."
+    ),
 ) -> None:
     """Create and start a run of LOOP for PROJECT."""
     c = build_container(config, notifier_override=notifier)
@@ -162,10 +249,23 @@ def run(
             err=True,
         )
         raise typer.Exit(1)
+
+    data: Optional[dict] = None
+    if loop == "dev_task":
+        number = issue if issue is not None else co.find_claimable(
+            c.github, repo=proj.repo, instance_id=c.cfg.instance.instance_id
+        )
+        if number is None:
+            typer.echo(f"no queued work for '{project}' ({proj.repo})")
+            return
+        data = {"issue_number": number, "repo": proj.repo}
+        typer.echo(f"working issue #{number} on {proj.repo}")
+
     runner = _build_runner(c, loop, proj)
-    record = runner.create_run(project_id=project, breakers=_breakers_for(c.cfg, proj))
+    record = runner.create_run(project_id=project, breakers=_breakers_for(c.cfg, proj), data=data)
     typer.echo(f"created run {record.run_id}")
     status = runner.run(record.run_id)
+    _mark_blocked_if_aborted(c, record.run_id, status)
     _report(c, record.run_id, status)
 
 
@@ -198,33 +298,73 @@ def answer(
     status = runner.resume(run_id, response)
     if isinstance(c.notifier, FileNotifier):
         c.notifier.archive(req.request_id)
+    _mark_blocked_if_aborted(c, run_id, status)
     _report(c, run_id, status)
 
 
 @app.command()
 def poll(config: Optional[Path] = CONFIG_OPT) -> None:
-    """Scan the file-notifier inbox for answers and resume any matching runs."""
+    """Resume any WAITING run whose answer has arrived (the scheduler's resume phase)."""
     c = build_container(config)
     if not isinstance(c.notifier, FileNotifier):
         typer.echo("poll requires the file notifier", err=True)
         raise typer.Exit(1)
-    waiting = c.store.list(status=RunStatus.WAITING)
-    if not waiting:
-        typer.echo("no runs waiting")
+    resumed = _build_scheduler(c).resume_waiting()
+    if not resumed:
+        typer.echo("no runs resumed")
         return
-    for record in waiting:
-        req = record.pending_request
-        if req is None:
-            continue
-        response = c.notifier.collect(req)
-        if response is None:
-            typer.echo(f"{record.run_id}: still waiting (no response file)")
-            continue
-        proj = c.registry.get(record.project_id) if record.project_id else None
-        runner = _build_runner(c, record.loop_name, proj)
-        status = runner.resume(record.run_id, response)
-        c.notifier.archive(req.request_id)
-        typer.echo(f"{record.run_id}: resumed -> {status.value}")
+    for rid, status in resumed:
+        typer.echo(f"{rid}: resumed -> {status}")
+
+
+@app.command()
+def tick(config: Optional[Path] = CONFIG_OPT) -> None:
+    """Run ONE scheduling pass: resume answered gates, then start eligible work.
+
+    This is the unit an OS scheduler (Task Scheduler / launchd) invokes on a cadence.
+    Idempotent and short-lived — runs that hit a gate persist WAITING and the pass returns.
+    """
+    c = build_container(config)
+    _echo_tick(_build_scheduler(c).tick())
+
+
+@app.command()
+def watch(
+    config: Optional[Path] = CONFIG_OPT,
+    interval: Optional[int] = typer.Option(
+        None, "--interval", help="Seconds between ticks (default: scheduling.tick_interval_seconds)."
+    ),
+) -> None:
+    """Run tick() forever on an interval (Ctrl-C to stop) — for a machine without an OS scheduler."""
+    import time
+
+    every = interval or build_container(config).cfg.scheduling.tick_interval_seconds
+    typer.echo(f"watching every {every}s (Ctrl-C to stop)")
+    while True:
+        _echo_tick(_build_scheduler(build_container(config)).tick())
+        time.sleep(every)
+
+
+@app.command(name="discord-bot")
+def discord_bot(config: Optional[Path] = CONFIG_OPT) -> None:
+    """Run the always-on Discord bridge bot (a separate, long-lived process).
+
+    Listens for Approve/Reject clicks on gate messages and writes the answer back
+    into the inbox, then resumes the run. Requires DISCORD_BOT_TOKEN and the
+    `discord` extra (`uv sync --extra discord`).
+    """
+    c = build_container(config)
+    if not c.cfg.discord.token:
+        typer.echo("DISCORD_BOT_TOKEN is not set; cannot start the bot", err=True)
+        raise typer.Exit(1)
+    from harness.bots.discord_bot import run_bot
+
+    inbox = resolve_under(c.base_dir, c.cfg.notifier.inbox)
+
+    def on_answer() -> None:
+        _build_scheduler(build_container(config)).resume_waiting()
+
+    run_bot(token=c.cfg.discord.token, inbox=inbox, on_answer=on_answer)
 
 
 @app.command(name="list-runs")
@@ -261,10 +401,23 @@ def config_check(config: Optional[Path] = CONFIG_OPT) -> None:
         f"github: repo={cfg.github.repo} fake={cfg.github.use_in_memory_fake} "
         f"token={'set' if cfg.github.token else 'unset'}"
     )
+    typer.echo(
+        f"scheduling: enabled={cfg.scheduling.enabled} "
+        f"max_concurrent={cfg.scheduling.max_concurrent_runs} "
+        f"global_ceiling=${cfg.scheduling.global_spend_ceiling_usd:.2f}/{cfg.scheduling.spend_window}"
+    )
+    typer.echo(
+        f"discord: enabled={cfg.discord.enabled} "
+        f"gates_channel={'set' if cfg.discord.gates_channel_id else 'unset'} "
+        f"token={'set' if cfg.discord.token else 'unset'}"
+    )
     registry = FileProjectRegistry(cfg.projects, path.parent)
     for p in registry.list_projects():
+        sc = p.scheduling
         typer.echo(
-            f"  project {p.id}: owner={p.owner_instance} owned={owns(p, cfg.instance)} repo={p.repo}"
+            f"  project {p.id}: owner={p.owner_instance} owned={owns(p, cfg.instance)} "
+            f"repo={p.repo} priority={sc.priority} weight={sc.effective_weight():.2f} "
+            f"min_interval={sc.min_poll_interval_seconds}s"
         )
     typer.echo("OK")
 

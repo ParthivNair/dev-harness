@@ -14,9 +14,12 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+# priority name -> attention/budget weight (used when a project sets no explicit weight)
+PRIORITY_WEIGHTS: dict[str, float] = {"high": 4.0, "normal": 1.0, "low": 0.25}
 
 
 class AutonomyTier(str, Enum):
@@ -47,7 +50,9 @@ class GitHubConfig(BaseModel):
     repo: str = ""                 # coordination repo (issues/PRs) "owner/name"
     api_base: str = "https://api.github.com"
     use_in_memory_fake: bool = True  # M1 default: demo runs with no token/network
-    token: Optional[str] = None      # injected from env HARNESS_GITHUB_TOKEN, never TOML
+    # injected from env HARNESS_GITHUB_TOKEN, never TOML. repr=False so a credential
+    # can never leak into a traceback, log line, or pydantic repr.
+    token: Optional[str] = Field(default=None, repr=False)
 
 
 class StateStoreConfig(BaseModel):
@@ -56,9 +61,42 @@ class StateStoreConfig(BaseModel):
 
 
 class NotifierConfig(BaseModel):
-    selection: str = "file"        # "file" (durable) | "console" (interactive)
+    selection: str = "file"        # "file" (durable) | "console" (interactive) | "discord"
     log_path: str = ".harness/notifications.log"
     inbox: str = ".harness/inbox"  # where file requests/responses live
+
+
+class SchedulingConfig(BaseModel):
+    """Instance-level driver settings for the multi-project scheduler.
+
+    The scheduler allocates *attention* (which project to start next) and the
+    shared *spend budget* across all owned projects, layered on top of the
+    existing per-run circuit breakers. Off by default so M1 behaviour (manual
+    ``run``/``poll``) is unchanged.
+    """
+
+    enabled: bool = False
+    tick_interval_seconds: int = 300       # base cadence of ``harness watch``
+    max_concurrent_runs: int = 1           # how many runs may be active at once
+    global_spend_ceiling_usd: float = 20.0  # shared cap across ALL projects per window
+    spend_window: Literal["daily", "rolling_24h"] = "daily"
+    default_weight: float = 1.0
+
+
+class DiscordConfig(BaseModel):
+    """Discord routing — channel/guild IDs are config (NOT secret); the bot token
+    is injected from ``DISCORD_BOT_TOKEN`` in the environment, never from TOML."""
+
+    enabled: bool = False
+    guild_id: str = ""
+    gates_channel_id: str = ""        # #verification-gates (the human's inbox)
+    activity_channel_id: str = ""     # #activity (issues/PRs/labels)
+    alerts_channel_id: str = ""       # #alerts (breaker trips, failures)
+    runs_channel_id: str = ""         # #runs (lifecycle), optional
+    poll_after_answer: bool = True    # bot triggers resume after writing a response
+    project_channels: dict[str, str] = Field(default_factory=dict)  # project id -> channel id
+    # injected from env DISCORD_BOT_TOKEN, never TOML. repr=False — see GitHubConfig.token.
+    token: Optional[str] = Field(default=None, repr=False)
 
 
 class ProjectPointer(BaseModel):
@@ -75,6 +113,8 @@ class HarnessConfig(BaseModel):
     notifier: NotifierConfig = Field(default_factory=NotifierConfig)
     autonomy: dict[str, AutonomyTier] = Field(default_factory=dict)
     circuit_breakers: CircuitBreakers = Field(default_factory=CircuitBreakers)
+    scheduling: SchedulingConfig = Field(default_factory=SchedulingConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
     projects: list[ProjectPointer] = Field(default_factory=list)
 
 
@@ -106,6 +146,26 @@ class ProjectOverrides(BaseModel):
     autonomy: dict[str, AutonomyTier] = Field(default_factory=dict)
 
 
+class ProjectScheduling(BaseModel):
+    """Per-project attention/cadence knobs. Lives in the repo's
+    ``harness.project.toml`` so the other machine reads the identical cadence.
+
+    ``min_poll_interval_seconds`` is the "check the lower-effort repo less
+    frequently" knob; ``priority``/``weight`` set its share of attention + budget.
+    """
+
+    priority: Literal["high", "normal", "low"] = "normal"
+    weight: Optional[float] = None             # explicit override of priority's weight
+    min_poll_interval_seconds: int = 900       # minimum gap between starts for this project
+    loops: list[str] = Field(default_factory=lambda: ["dev_task"])
+    arch_review_cadence_seconds: Optional[int] = None  # None => never auto-run arch_review
+
+    def effective_weight(self, default: float = 1.0) -> float:
+        if self.weight is not None:
+            return self.weight
+        return PRIORITY_WEIGHTS.get(self.priority, default)
+
+
 class ProjectConfig(BaseModel):
     schema_version: int = 1
     id: str
@@ -116,6 +176,7 @@ class ProjectConfig(BaseModel):
     commands: ProjectCommands = Field(default_factory=ProjectCommands)
     prompts: PromptSet = Field(default_factory=PromptSet)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    scheduling: ProjectScheduling = Field(default_factory=ProjectScheduling)
     overrides: ProjectOverrides = Field(default_factory=ProjectOverrides)
 
     def effective_breakers(self, default: CircuitBreakers) -> CircuitBreakers:

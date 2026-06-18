@@ -9,7 +9,13 @@ dependencies = [
     "typer>=0.12",
     "jsonschema>=4.21",
     "PyGithub>=2.3",
+    "python-dotenv>=1.0",
 ]
+
+[project.optional-dependencies]
+# The Discord notifier + bridge bot. Optional so the core engine and the
+# fakes-only test path never import discord.py. Install with: uv sync --extra discord
+discord = ["discord.py>=2.4"]
 
 [project.scripts]
 harness = "harness.cli.main:app"
@@ -44,3 +50,8 @@ src = ["src", "tests"]
 [tool.mypy]
 python_version = "3.12"
 packages = ["harness"]
+
+# discord.py is an optional extra (only the bridge bot imports it, lazily).
+[[tool.mypy.overrides]]
+module = "discord.*"
+ignore_missing_imports = true

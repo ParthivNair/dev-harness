@@ -4,15 +4,15 @@
 schema_version = 1
 
 [instance]
-instance_id = "this-machine"        # the partition key; a project's owner_instance must match
+instance_id = "WindowsDesktop"      # the partition key; a project's owner_instance must match
 display_name = "dev-harness (local demo)"
 platform = "windows"                 # informational only — the engine never branches on it
 
 [github]
-account = "parthivnair1"
-repo = "parthivnair1/dev-harness-coordination"
+account = "ParthivNair"
+repo = "ParthivNair/dev-harness"     # informational only today; the loops use each project's own repo
 api_base = "https://api.github.com"
-use_in_memory_fake = true            # M1 default: the demo runs with no token / no network
+use_in_memory_fake = false           # false = real GitHub via PyGithub + HARNESS_GITHUB_TOKEN
 
 [state_store]
 backend = "json"                     # one atomic JSON file per run (M1); sqlite later
@@ -41,7 +41,21 @@ max_iterations = 5
 spend_ceiling_usd = 5.0
 spend_is_hard_stop = true
 
+# The scheduler (drives `harness tick` / `harness watch`). Off by default; the
+# demo runs loops manually. Flip enabled + use_in_memory_fake=false to go live.
+[scheduling]
+enabled = false
+tick_interval_seconds = 300
+max_concurrent_runs = 2
+global_spend_ceiling_usd = 20.0
+spend_window = "daily"
+
 # --- Registered projects: pointers to per-repo configs ---
 [[projects]]
 id = "sample"
 path = "examples/sample-project"
+
+# Dogfooding: the harness manages itself. Its per-project config is ./harness.project.toml.
+[[projects]]
+id = "dev-harness"
+path = "."

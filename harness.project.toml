@@ -1,0 +1,35 @@
+# The harness as a managed project OF ITSELF (dogfooding). The repo root IS the
+# managed repo, so the dev loop can propose the harness's own next milestone as a
+# DRAFT PR a human merges — it cannot merge, push, or force-push (no port exists).
+# The pytest suite is the `test` step, i.e. the self-modification safety net.
+schema_version = 1
+
+[project]
+id = "dev-harness"
+display_name = "dev-harness (self-managed)"
+repo = "ParthivNair/dev-harness"
+owner_instance = "WindowsDesktop"    # the Windows install owns it; the Mac reads it
+description = "The harness manages its own next milestone — draft PRs a human merges."
+
+[commands]
+build = ["uv", "run", "python", "-c", "import harness"]   # import smoke
+test = ["uv", "run", "pytest", "-q"]                        # the real suite = the safety net
+cwd = "."
+
+[prompts]
+root = ".harness/prompts"
+dev_task = ".harness/prompts/dev_task.md"
+arch_review = ".harness/prompts/arch_review.md"
+
+[scheduling]
+priority = "normal"
+min_poll_interval_seconds = 1800       # at most every 30 min
+loops = ["dev_task"]
+arch_review_cadence_seconds = 86400    # review itself ~daily, files its own tickets
+
+[claude]
+model = "claude-opus-4-8"
+permission_mode = "acceptEdits"
+# Belt-and-suspenders alongside the structural guard: the loop never commits/pushes;
+# it edits the working tree and the harness opens the draft PR via the GitHub API.
+disallowed_tools = ["Bash(git push:*)", "Bash(git commit:*)"]

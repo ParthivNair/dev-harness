@@ -48,9 +48,37 @@ max_iterations = 8
 spend_ceiling_usd = 5.0
 spend_is_hard_stop = true
 
+# The multi-project scheduler (drives `harness tick` / `harness watch`). Off by
+# default; turn it on to let one machine run several repos with different cadences.
+[scheduling]
+enabled = false
+tick_interval_seconds = 300          # base cadence of `harness watch`
+max_concurrent_runs = 2              # how many runs may be active at once
+global_spend_ceiling_usd = 20.0      # shared cap across ALL projects per window
+spend_window = "daily"               # daily | rolling_24h
+default_weight = 1.0
+
+# Discord routing. Channel/guild IDs are config (NOT secret); the bot token comes
+# from DISCORD_BOT_TOKEN in the environment, never here. Set notifier.selection =
+# "discord" to post gates to Discord (they still mirror to the durable file inbox).
+[discord]
+enabled = false
+guild_id = "000000000000000000"
+gates_channel_id = "000000000000000000"     # #verification-gates (the human's inbox)
+activity_channel_id = "000000000000000000"  # #activity (issues/PRs/labels)
+alerts_channel_id = "000000000000000000"    # #alerts (breaker trips, failures)
+runs_channel_id = "000000000000000000"      # #runs (lifecycle), optional
+poll_after_answer = true
+
 # Register each managed project as a pointer to where its repo sits on THIS disk.
 # The project's own config (owner, build/test commands, prompts) lives in that repo.
 [[projects]]
 id = "macdaw"
 path = "D:/dev/macdaw"
 # config_file = "harness.project.toml"   # optional override of the discovered filename
+
+# Dogfooding: register the harness as a managed project of itself (path = its repo).
+# Its per-project config is ./harness.project.toml at the harness repo root.
+[[projects]]
+id = "dev-harness"
+path = "D:/dev/dev-harness"

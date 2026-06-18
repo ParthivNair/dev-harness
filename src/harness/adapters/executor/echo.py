@@ -25,6 +25,11 @@ class EchoExecutor:
     def run_test(self, *, project: ProjectConfig) -> CommandResult:
         return CommandResult(0, f"[echo] tests {project.id} passed", "", 0.01)
 
+    def publish_branch(
+        self, *, project: ProjectConfig, branch: str, commit_message: str
+    ) -> CommandResult:
+        return CommandResult(0, f"[echo] published {branch}", "", 0.01)
+
     def run_claude_task(
         self,
         *,

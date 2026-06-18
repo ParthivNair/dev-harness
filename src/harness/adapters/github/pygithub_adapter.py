@@ -28,6 +28,7 @@ def _to_issue_ref(issue: Any) -> IssueRef:
         labels=tuple(label.name for label in issue.labels),
         assignee=issue.assignee.login if issue.assignee else None,
         url=issue.html_url,
+        body=issue.body or "",
     )
 
 

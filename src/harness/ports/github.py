@@ -29,6 +29,7 @@ class IssueRef:
     labels: tuple[str, ...]
     assignee: Optional[str]
     url: str
+    body: str = ""  # the task description a dev loop feeds to Claude (default-last, additive)
 
 
 @dataclass(frozen=True)

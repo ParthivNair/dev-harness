@@ -2,7 +2,13 @@
 
 A **headless, portable engine that orchestrates AI-assisted development across many repos.** The *same* engine runs as independent installs per machine; each install acts only on the projects whose build + human-verification surface lives on that platform. There is **no central dispatcher and no cross-machine RPC** — installs coordinate the way two teammates would: **through GitHub** (Issues = task queue, labels + PR state = status, one shared account).
 
-> Milestone 1 status: the engine core, the durable VerificationGate (pause/persist/resume), the ports, a sample registered project, and an end-to-end demo loop are implemented. The Discord notifier, the real architecture-review / dev-test loops, GitHub Actions / branch-protection wiring, and any GUI are explicit follow-ups (see below).
+> Status: **Milestone 2** adds the orchestration layer on top of the M1 core — the real
+> **dev/test loop** (claim issue → generate → build → test → human gate → draft PR), the
+> bounded **architecture-review loop**, the **GitHub-native coordination** (Issues = queue,
+> labels = state, an owner label = a lease), the weighted **multi-project scheduler**
+> (`harness tick`/`watch`) that diverts attention across repos, and a **Discord** notifier +
+> bridge bot. The harness is registered as a managed project of itself (dogfooding). Remaining
+> follow-ups (SQLite store, GitHub Actions wiring, a GUI) are listed at the end.
 
 ## Why this exists
 
@@ -18,11 +24,13 @@ Hexagonal (ports & adapters). The engine depends only on **ports** (`typing.Prot
 src/harness/
 ├── domain/         models.py    — durable, JSON-serializable types (RunRecord, VerificationRequest/Response, ...)
 ├── ports/          run_store / notifier / github / executor / project_registry  (Protocols)
-├── application/    loop_runner (the engine) · action_guard (autonomy) · ownership
-├── adapters/       state/json_store · notifier/{console,file} · github/{fake,pygithub_adapter} ·
+├── application/    loop_runner (the engine) · action_guard (autonomy) · ownership ·
+│                   coordination (issue lease + label state machine) · scheduler (attention/spend)
+├── adapters/       state/json_store · notifier/{console,file,discord} · github/{fake,pygithub_adapter} ·
 │                   executor/{echo,subprocess_executor} · registry/file_registry
-├── config/         models.py (pydantic) · loader.py (tomllib + env)
-├── loops/          demo.py (the Milestone-1 demo loop)
+├── loops/          demo · dev_task (generate→build→test→gate→draft PR) · arch_review (rubric→issues)
+├── bots/           discord_bot (the always-on gateway bridge)
+├── config/         models.py (pydantic) · loader.py (tomllib + env + .env)
 └── cli/            main.py (Typer commands + composition root)
 ```
 
@@ -39,7 +47,7 @@ One atomic JSON file per run (`RunStore` port → `AtomicJsonRunStore`). Writes 
 ### Guardrails (baked in from day one)
 
 - **Autonomy taxonomy as config** (`[autonomy]`): every action is `autonomous`, `gated`, or `forbidden`. The `ActionGuard` classifies by name and `ALLOW` / `GATE` / `REFUSE`s at the boundary — the LLM proposes, code decides. Unknown actions default to `gated` (fail safe).
-- **Structural safety**: the `GitHubAdapter` port has **no** merge / push / force-push method, and `open_draft_pr` always sets `draft=True`. The autonomous path *cannot* touch `main` or force-push, because there is no code that can.
+- **Structural safety**: the `GitHubAdapter` port has **no** merge method, and `open_draft_pr` always sets `draft=True`. The one push path is `Executor.publish_branch`, which is deliberately narrow — it refuses trunks (`main`/`master`/…) and never force-pushes, so it can publish a `harness/*` feature branch for a PR but *cannot* touch `main`. The merge stays human.
 - **Circuit breakers on every loop**: a max-iterations cap and a spend ceiling (fed by `total_cost_usd` from `claude -p --output-format json`). Counters are persisted and read back before acting on resume, so a crash can't reset a budget or escape the cap.
 
 ### Coordination (cross-machine)
@@ -98,10 +106,60 @@ uv run pytest            # unit + integration (in-memory fakes; no network)
 
 The fakes are the production default wiring, so tests exercise the real default path. The integration test proves durability by resuming a run through **fresh store/runner instances** (simulating separate processes).
 
-## Out of scope for Milestone 1 (planned follow-ups)
+## Milestone 2 — the orchestration layer ("a team of employees")
 
-- A real **Discord** notifier (another implementation of the `Notifier` port).
-- The **architecture-review loop** (bounded, rubric-driven, with a "no action needed" exit) and the **dev/test loop** (generate → test → verify → draft PR).
-- GitHub **Actions / branch-protection** wiring and live two-machine coordination.
+GitHub is the office: **Issues = task queue, labels = status, draft PRs = work product,
+assignee + an `harness:owner:<id>` label = a single-writer lease.** Each machine runs the
+same engine and acts only on projects it owns; they coordinate through GitHub, no central
+dispatcher.
+
+```bash
+# Real dev loop: claim a queued issue, generate, build, test, gate, open a DRAFT PR.
+uv run harness run dev_task dev-harness --issue 42     # or omit --issue to claim the next queued
+uv run harness answer <RUN_ID> --approve               # the gate -> opens the draft PR
+
+# Architecture review: rubric -> structured findings -> filed issues (the dev loop's queue).
+uv run harness run arch_review dev-harness
+
+# The scheduler: one pass = resume answered gates, then start eligible work, weighted by
+# priority/cadence. This is the unit an OS scheduler invokes; `watch` loops it.
+uv run harness tick
+uv run harness watch --interval 300
+```
+
+- **Label state machine:** `queued → in-progress → needs-verification → pr-open → done` (+ `blocked` on a breaker trip). Claiming is an optimistic lease with a confirm-read tiebreak (`set_labels` is last-writer-wins), so two machines never double-claim.
+- **Attention diversion:** per-project `[scheduling]` (`priority`/`weight`, `min_poll_interval_seconds`) makes the scheduler check a low-effort repo less often and give a high-priority repo more starts. A **global spend ceiling** (per window) halts new starts while in-flight gates still resume.
+- **The autonomy ceiling:** the loop publishes its work to a `harness/*` feature branch (`Executor.publish_branch` — guarded: no trunks, no force-push) and opens a **draft** PR. It **cannot merge** — the GitHub port has no merge method, so the merge is always a human's. The harness is registered as a managed project of itself (`harness.project.toml`), so it proposes its own next milestone as a draft PR you review.
+
+### Secrets & `.env`
+
+Copy `.env.example` → `.env` (gitignored, per machine). Secrets live in the environment,
+never in TOML; non-secret Discord channel IDs live in `harness.toml` under `[discord]`.
+
+| Secret | For |
+|---|---|
+| `HARNESS_GITHUB_TOKEN` | Fine-grained PAT — Issues RW, Pull requests RW, Contents RW, Metadata R |
+| `DISCORD_BOT_TOKEN` | The Discord notifier's posts + the bridge bot (only if `notifier.selection="discord"`) |
+| Claude Code CLI auth | Separate — the `claude` CLI authenticates itself; `ANTHROPIC_API_KEY` only if it uses API-key mode |
+
+### Discord (optional)
+
+Set `notifier.selection = "discord"` and fill `[discord]`. `notify()` writes the durable
+request file **then** posts Approve/Reject buttons to `#verification-gates` — Discord bridges
+*to* the inbox, it doesn't replace it. The always-on bot is a **separate** process
+(`uv run harness discord-bot`, needs `uv sync --extra discord`) that turns a click into a
+`<request_id>.response.json` and resumes the run. Bot down ⇒ gates still answerable via CLI.
+
+### Always-on runtime (two machines)
+
+Each machine runs its own stack and coordinates via GitHub:
+
+- **Windows** (owns `dev-harness`): `harness tick` on a **Task Scheduler** trigger (every few minutes, "run whether logged on or not", with `.env` supplying secrets); the Discord bot as an **NSSM** service (auto-restart, starts at boot).
+- **macOS** (owns the next app): the same two roles via **launchd** — `StartInterval` for `tick`, a `KeepAlive` plist for the bot. Same commands, different supervisor; the engine never branches on platform.
+
+## Still out of scope (planned follow-ups)
+
+- GitHub **Actions / branch-protection** wiring and a stale-lease reconciler.
 - A **SQLite** `RunStore`; cross-process locking / CAS on run records.
+- Artifact upload to Discord (multipart) and per-project gate channels.
 - Sketch → Figma, and any **cockpit GUI**.

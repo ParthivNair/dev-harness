@@ -22,6 +22,11 @@ class ExecutorError(RuntimeError):
     pass
 
 
+# Branches the harness must never publish onto. The autonomous path may push a
+# namespaced feature branch only — never a trunk, never a force-push.
+_PROTECTED_BRANCHES = frozenset({"main", "master", "trunk", "develop", "HEAD"})
+
+
 class SubprocessExecutor:
     def __init__(
         self,
@@ -56,6 +61,34 @@ class SubprocessExecutor:
 
     def run_test(self, *, project: ProjectConfig) -> CommandResult:
         return self._run(self._as_argv(project.commands.test), self._cwd(project))
+
+    def publish_branch(
+        self, *, project: ProjectConfig, branch: str, commit_message: str
+    ) -> CommandResult:
+        # Structural guardrail: a namespaced feature branch ONLY. Refuse trunks and
+        # anything not clearly a feature branch; never force-push anywhere.
+        if branch in _PROTECTED_BRANCHES or "/" not in branch:
+            raise ExecutorError(
+                f"refusing to publish '{branch}': only namespaced feature branches "
+                f"(e.g. 'harness/<instance>/issue-N') may be pushed, never a trunk"
+            )
+        cwd = self._cwd(project)
+        # Create/reset the feature branch at HEAD (working-tree edits are preserved),
+        # commit everything, and push WITHOUT --force. A human still merges.
+        self._git(["checkout", "-B", branch], cwd)
+        self._git(["add", "-A"], cwd)
+        commit = self._run(["git", "commit", "-m", commit_message], cwd)
+        if not commit.ok and "nothing to commit" in (commit.stdout + commit.stderr).lower():
+            raise ExecutorError("nothing to publish: the task produced no file changes")
+        if not commit.ok:
+            raise ExecutorError(f"git commit failed ({commit.exit_code}): {commit.stderr[:300]}")
+        return self._git(["push", "-u", "origin", branch], cwd)
+
+    def _git(self, args: list[str], cwd: Path) -> CommandResult:
+        result = self._run(["git", *args], cwd)
+        if not result.ok:
+            raise ExecutorError(f"git {args[0]} failed ({result.exit_code}): {result.stderr[:300]}")
+        return result
 
     def run_claude_task(
         self,

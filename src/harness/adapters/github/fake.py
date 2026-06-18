@@ -75,6 +75,7 @@ class InMemoryGitHub:
             labels=tuple(labels),
             assignee=assignee,
             url=f"https://github.com/{repo}/issues/{number}",
+            body=body,
         )
         self._issues[(repo, number)] = issue
         return issue
@@ -88,6 +89,7 @@ class InMemoryGitHub:
             labels=tuple(labels),
             assignee=issue.assignee,
             url=issue.url,
+            body=issue.body,
         )
         self._issues[(repo, number)] = updated
         return updated
@@ -106,6 +108,7 @@ class InMemoryGitHub:
             labels=issue.labels,
             assignee=assignee,
             url=issue.url,
+            body=issue.body,
         )
         self._issues[(repo, number)] = updated
         return updated

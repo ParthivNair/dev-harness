@@ -128,10 +128,13 @@ class LoopRunner:
         *,
         project_id: Optional[str] = None,
         breakers: Optional[BreakerState] = None,
+        data: Optional[dict[str, Any]] = None,
     ) -> RunRecord:
         record = RunRecord(loop_name=self.loop.name, project_id=project_id)
         if breakers is not None:
             record.breakers = breakers
+        if data:
+            record.data.update(data)  # seed loop inputs (e.g. issue_number, repo)
         self.store.create(record)
         return record
 

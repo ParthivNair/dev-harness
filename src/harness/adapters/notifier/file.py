@@ -64,6 +64,13 @@ class FileNotifier:
         atomic_write_text(path, response.model_dump_json(indent=2))
         return path
 
+    def write_response_payload(self, request_id: str, payload: dict) -> Path:
+        """Persist a minimal ``{answer, via}`` response when only the request_id is
+        known (the Discord bridge). ``collect()`` backfills run_id/step_id."""
+        path = self._response_path(request_id)
+        atomic_write_text(path, json.dumps(payload, indent=2))
+        return path
+
     def archive(self, request_id: str) -> None:
         """Move a consumed request/response pair into ``inbox/done/``."""
         self.done_dir.mkdir(parents=True, exist_ok=True)

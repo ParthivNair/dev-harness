@@ -50,3 +50,12 @@ class Executor(Protocol):
     def run_build(self, *, project: ProjectConfig) -> CommandResult: ...
 
     def run_test(self, *, project: ProjectConfig) -> CommandResult: ...
+
+    def publish_branch(
+        self, *, project: ProjectConfig, branch: str, commit_message: str
+    ) -> CommandResult:
+        """Commit the working tree and push it to a FEATURE branch so a draft PR can
+        reference it. The autonomous path needs this, but it is deliberately narrow:
+        implementations MUST refuse ``main``/``master`` and MUST NOT force-push. The
+        GitHubAdapter still has no merge/push — only this guarded feature-branch push
+        exists, and a human still merges."""

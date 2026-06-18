@@ -14,8 +14,9 @@ build/
 # Secrets
 .env
 
-# Runtime state (durable run records, notifier inbox, artifacts) at the repo root.
-# Anchored so a managed project's own .harness/ (prompts) is NOT ignored — those
-# live with the repo on purpose. Kept local per-machine; the cross-machine
-# substrate is GitHub, not this dir.
-/.harness/
+# Runtime state (durable run records, notifier inbox, artifacts, scheduler ledger)
+# at the repo root is machine-local and ignored. EXCEPT .harness/prompts/, which is
+# the self-managed harness's own prompt set — version-controlled so the other
+# machine reads the identical prompts. The cross-machine substrate is GitHub.
+/.harness/*
+!/.harness/prompts/

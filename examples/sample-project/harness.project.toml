@@ -6,8 +6,8 @@ schema_version = 1
 [project]
 id = "sample"
 display_name = "Sample Project"
-repo = "parthivnair1/sample-project"
-owner_instance = "this-machine"      # only the install with this instance_id acts autonomously
+repo = "ParthivNair/sample-project"
+owner_instance = "WindowsDesktop"    # only the install with this instance_id acts autonomously
 description = "A self-contained sample project that drives the Milestone 1 demo loop."
 
 [commands]
@@ -20,6 +20,15 @@ cwd = "."
 [prompts]
 root = ".harness/prompts"
 dev_task = ".harness/prompts/dev_task.md"
+
+# How the scheduler should treat this project. `min_poll_interval_seconds` +
+# `priority` are the "check the lower-effort repo less frequently" knobs.
+[scheduling]
+priority = "normal"                  # high | normal | low  -> weight 4 / 1 / 0.25
+min_poll_interval_seconds = 900
+loops = ["dev_task"]
+# weight = 0.5                        # explicit override of priority's weight
+# arch_review_cadence_seconds = 86400
 
 [claude]
 model = "claude-opus-4-8"
