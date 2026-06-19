@@ -52,10 +52,12 @@ class SubprocessExecutor:
                 f"(e.g. 'harness/<instance>/issue-N') may be pushed, never a trunk"
             )
 
-    def _run(self, argv: list[str], cwd: Path) -> CommandResult:
+    def _run(
+        self, argv: list[str], cwd: Path, *, stdin_text: Optional[str] = None
+    ) -> CommandResult:
         start = time.monotonic()
         proc = subprocess.run(
-            argv, cwd=str(cwd), shell=False, capture_output=True, text=True
+            argv, cwd=str(cwd), shell=False, capture_output=True, text=True, input=stdin_text
         )
         return CommandResult(
             exit_code=proc.returncode,
@@ -230,10 +232,13 @@ class SubprocessExecutor:
         worktree: Optional[Path] = None,
     ) -> ClaudeResult:
         c = project.claude
+        # NB: the prompt goes over STDIN, not as an argv element. A pr_review prompt
+        # embeds the PR diff (~30k chars) and would blow the OS command-line length
+        # limit (Windows error 206) if passed inline. `claude -p` reads the prompt from
+        # stdin when none is given on the command line.
         argv = [
             self._claude,
             "-p",
-            prompt,
             "--output-format",
             "json",
             "--model",
@@ -251,15 +256,22 @@ class SubprocessExecutor:
             argv += ["--json-schema", json.dumps(json_schema)]
 
         cwd = Path(worktree) if worktree is not None else self._root_of(project.id)
-        result = self._run(argv, cwd)
+        result = self._run(argv, cwd, stdin_text=prompt)
         if not result.ok:
             raise ExecutorError(
                 f"claude exited {result.exit_code}: {result.stderr[:500]}"
             )
         payload = json.loads(result.stdout)
         usage = payload.get("usage", {})
+        # With --json-schema, the schema-validated object is in `structured_output`
+        # (a dict); `result` holds only the human-readable prose. Loops that pass a
+        # schema parse result_text as JSON, so surface the structured object when present.
+        structured = payload.get("structured_output")
+        result_text = (
+            json.dumps(structured) if structured is not None else payload.get("result", "")
+        )
         return ClaudeResult(
-            result_text=payload.get("result", ""),
+            result_text=result_text,
             session_id=payload.get("session_id"),
             total_cost_usd=float(payload.get("total_cost_usd", 0.0)),
             input_tokens=int(usage.get("input_tokens", payload.get("input_tokens", 0))),
