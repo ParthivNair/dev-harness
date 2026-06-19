@@ -196,6 +196,24 @@ def cancel_issue(c: Container, *, project_id: str, number: int) -> IssueRef:
     return co.release(c.github, repo=proj.repo, number=number)
 
 
+def mark_done(c: Container, *, project_id: str, number: int) -> IssueRef:
+    """Close a merged issue's lifecycle: ``pr-open -> done``, dropping the lease.
+
+    The operator runs this after merging the draft PR a dev_task opened. Guarded by
+    the same ownership check as :func:`cancel_issue` — reading another install's
+    project is fine, acting on it is not. Touches GitHub labels ONLY. Refuses (via
+    :func:`coordination.done`) unless the issue is currently ``pr-open``, so a wrong
+    issue number surfaces as an error rather than silently mislabeling the board.
+    """
+    proj = c.registry.get(project_id)
+    if not owns(proj, c.cfg.instance):
+        raise NotOwned(
+            f"instance '{c.cfg.instance.instance_id}' does not own project "
+            f"'{project_id}' (owner: {proj.owner_instance})"
+        )
+    return co.done(c.github, repo=proj.repo, number=number)
+
+
 def tick_once(c: Container) -> TickReport:
     """One scheduling pass (resume answered gates, then start eligible work)."""
     return build_scheduler(c).tick()

@@ -208,6 +208,30 @@ def cancel(
 
 
 @app.command()
+def done(
+    project: str = typer.Argument(..., help="Registered project id."),
+    issue: int = typer.Argument(..., help="Merged issue number to close out (pr-open -> done)."),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Close a merged issue's lifecycle: harness:pr-open -> harness:done (owner dropped).
+
+    Run this after a human merges the draft PR a dev_task opened. Touches GitHub
+    labels ONLY. Refuses unless the issue is currently pr-open, so a wrong number is
+    caught rather than silently mislabeling the board.
+    """
+    c = build_container(config)
+    try:
+        ref = operations.mark_done(c, project_id=project, number=issue)
+    except operations.NotOwned as exc:
+        typer.echo(f"refusing: {exc}. Reads are fine; acting is not.", err=True)
+        raise typer.Exit(1)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"issue #{issue}: state={co.state_of(ref)} owner={co.owner_of(ref)}")
+
+
+@app.command()
 def answer(
     run_id: str = typer.Argument(..., help="The waiting run's id."),
     approve: bool = typer.Option(..., "--approve/--reject", help="Approve or reject the gate."),

@@ -208,6 +208,28 @@ def test_global_spend_ceiling_halts_new_starts(tmp_path: Path) -> None:
     assert co.find_claimable(gh, repo="acme/app", instance_id=INSTANCE) is not None  # work remains
 
 
+def test_tick_reconciles_stale_lease_from_crashed_owner(tmp_path: Path) -> None:
+    clock = Clock()
+    sched, gh, store, _ = _make(tmp_path, [_project("app")], clock=clock, max_concurrent=1)
+    (n,) = _queue(gh, "acme/app", 1)
+    # Simulate a crash mid-run: we hold the lease (in-progress, our owner label) but
+    # no run was ever persisted, so nothing would otherwise requeue it.
+    co.claim(gh, repo="acme/app", number=n, instance_id=INSTANCE)
+    assert co.state_of(gh.get_issue(repo="acme/app", number=n)) == co.IN_PROGRESS
+
+    report = sched.tick()
+    assert report.reconciled == [("app", n)]  # the reconciler requeued our orphan
+
+
+def test_tick_leaves_a_live_run_lease_untouched(tmp_path: Path) -> None:
+    clock = Clock()
+    sched, gh, store, _ = _make(tmp_path, [_project("app")], clock=clock, max_concurrent=1)
+    _queue(gh, "acme/app", 1)
+    sched.tick()                      # starts a run that gates -> WAITING (a live lease)
+    report = sched.tick()             # second pass: the run is still active
+    assert report.reconciled == []    # a lease backed by an active run is not reclaimed
+
+
 def test_arch_review_runs_on_its_own_cadence(tmp_path: Path) -> None:
     clock = Clock(1000.0)
     proj = _project("app", arch_cadence=3600)  # daily-ish review; no dev work queued

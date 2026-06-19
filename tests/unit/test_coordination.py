@@ -6,6 +6,8 @@ last-writer-wins ``set_labels`` semantics the lease relies on are the real ones.
 
 from __future__ import annotations
 
+import pytest
+
 from harness.adapters.github.fake import InMemoryGitHub
 from harness.application import coordination as co
 
@@ -128,6 +130,30 @@ def test_reconcile_is_idempotent() -> None:
     assert co.reconcile_orphans(gh, repo=REPO, instance_id="win", active_run_issue_numbers=set()) == [n]
     # Second pass: the issue is queued again, so there is nothing left to reclaim.
     assert co.reconcile_orphans(gh, repo=REPO, instance_id="win", active_run_issue_numbers=set()) == []
+
+
+def test_done_from_pr_open_drops_lease_and_marks_done() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh, labels=(co.QUEUED, "bug"))
+    co.claim(gh, repo=REPO, number=n, instance_id="A")
+    co.transition(gh, repo=REPO, number=n, to_state=co.PR_OPEN)  # lease preserved
+    co.done(gh, repo=REPO, number=n)
+    issue = gh.get_issue(repo=REPO, number=n)
+    assert co.state_of(issue) == co.DONE
+    assert co.owner_of(issue) is None              # lease dropped
+    assert "bug" in issue.labels                   # foreign labels kept
+    assert co.PR_OPEN not in issue.labels          # old state dropped
+
+
+def test_done_refuses_non_pr_open_issue() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh)
+    co.claim(gh, repo=REPO, number=n, instance_id="A")  # now in-progress, not pr-open
+    with pytest.raises(ValueError, match=co.PR_OPEN):
+        co.done(gh, repo=REPO, number=n)
+    issue = gh.get_issue(repo=REPO, number=n)
+    assert co.state_of(issue) == co.IN_PROGRESS    # unchanged
+    assert co.owner_of(issue) == "A"               # lease intact
 
 
 def test_find_claimable_returns_lowest_queued_and_skips_claimed() -> None:
