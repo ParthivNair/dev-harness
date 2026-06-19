@@ -30,6 +30,7 @@ src/harness/
 ├── adapters/       state/json_store · notifier/{console,file,discord} · github/{fake,pygithub_adapter} ·
 │                   executor/{echo,subprocess_executor} · registry/file_registry
 ├── loops/          demo · dev_task (generate→build→test→gate→draft PR) · arch_review (rubric→issues)
+│                   · pr_review (select→CI/mergeable gate→review→merge; per-repo merge opt-in)
 ├── bots/           discord_bot (the always-on gateway bridge)
 ├── config/         models.py (pydantic) · loader.py (tomllib + env + .env)
 └── cli/            main.py (Typer commands + composition root)
@@ -48,7 +49,7 @@ One atomic JSON file per run (`RunStore` port → `AtomicJsonRunStore`). Writes 
 ### Guardrails (baked in from day one)
 
 - **Autonomy taxonomy as config** (`[autonomy]`): every action is `autonomous`, `gated`, or `forbidden`. The `ActionGuard` classifies by name and `ALLOW` / `GATE` / `REFUSE`s at the boundary — the LLM proposes, code decides. Unknown actions default to `gated` (fail safe).
-- **Structural safety**: the `GitHubAdapter` port has **no** merge method, and `open_draft_pr` always sets `draft=True`. The one push path is `Executor.publish_branch`, which is deliberately narrow — it refuses trunks (`main`/`master`/…) and never force-pushes, so it can publish a `harness/*` feature branch for a PR but *cannot* touch `main`. The merge stays human.
+- **Structural safety**: `open_draft_pr` always sets `draft=True`, and the only local push path is `Executor.publish_branch`, deliberately narrow — it refuses trunks (`main`/`master`/…) and never force-pushes, so it can publish a `harness/*` feature branch but *cannot* touch `main`. Merging to `main` is possible **only** via `GitHubAdapter.merge_pull`, the one trunk-touching write, and only through the `ActionGuard` with a **per-repo opt-in** (`merge_to_main` is `forbidden` in the instance default). So a repo that doesn't opt in keeps the draft-PR + human-merge ceiling exactly as before; an opted-in repo lets the `pr_review` loop close the loop (see below). There is still no `push`/`force_push` method anywhere.
 - **Circuit breakers on every loop**: a max-iterations cap and a spend ceiling (fed by `total_cost_usd` from `claude -p --output-format json`). Counters are persisted and read back before acting on resume, so a crash can't reset a budget or escape the cap.
 
 ### Coordination (cross-machine)
@@ -142,7 +143,22 @@ uv run harness watch --interval 300
 
 - **Label state machine:** `queued → in-progress → needs-verification → pr-open → done` (+ `blocked` on a breaker trip). Claiming is an optimistic lease with a confirm-read tiebreak (`set_labels` is last-writer-wins), so two machines never double-claim.
 - **Attention diversion:** per-project `[scheduling]` (`priority`/`weight`, `min_poll_interval_seconds`) makes the scheduler check a low-effort repo less often and give a high-priority repo more starts. A **global spend ceiling** (per window) halts new starts while in-flight gates still resume.
-- **The autonomy ceiling:** the loop publishes its work to a `harness/*` feature branch (`Executor.publish_branch` — guarded: no trunks, no force-push) and opens a **draft** PR. It **cannot merge** — the GitHub port has no merge method, so the merge is always a human's. The harness is registered as a managed project of itself (`harness.project.toml`), so it proposes its own next milestone as a draft PR you review.
+- **The autonomy ceiling (now configurable per repo):** the dev loop publishes its work to a `harness/*` feature branch (`Executor.publish_branch` — guarded: no trunks, no force-push) and opens a **draft** PR. By default the merge is still a human's. A repo can **close the loop** with the `pr_review` loop (below) by opting in per-repo. The harness is registered as a managed project of itself (`harness.project.toml`), so it proposes — and, opted in, merges — its own next milestone.
+
+### `pr_review` — closing the loop (review + merge, per repo)
+
+```bash
+# Review the next open harness-authored PR and (per the repo's merge policy) merge it.
+uv run harness run pr_review dev-harness            # auto-selects; or --pr <N> to target one
+```
+
+The loop runs `select_pr → ready_check → review → merge`: it picks an open PR on **this instance's** `harness/<instance>/issue-N` branch, gates on **mergeable + green CI** *before* spending on a review, asks Claude for a structured verdict over the diff, posts that review, and then merges per the repo's `merge_to_main` tier:
+
+- **`forbidden`** (instance default): review + comment, never merge — today's ceiling, unchanged.
+- **`gated`**: review → a verification gate → merge on your approval (fail-safe: timeout = no merge).
+- **`autonomous`**: review → merge directly, no human click — the fully closed loop.
+
+A repo opts in via its own `harness.project.toml` (`[overrides.autonomy] merge_to_main = "..."`), so each project sets its own policy. Merging only ever happens when the PR is mergeable, CI is not failing, the AI review approves with no blocking issues, and the action guard admits it. A PR it won't merge is tagged `harness:changes-requested` so it isn't re-reviewed every tick. Set `[scheduling] pr_review_cadence_seconds` to let the scheduler run it unattended.
 
 ### Secrets & `.env`
 

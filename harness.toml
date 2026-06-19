@@ -30,9 +30,13 @@ open_draft_pr = "autonomous"
 file_issue = "autonomous"
 set_labels = "autonomous"
 assign_issue = "autonomous"
+review_pr = "autonomous"            # posting a PR review/comment is low-risk
 mark_pr_ready = "gated"              # draft -> ready crosses into human territory
 dependency_change = "gated"
 schema_change = "gated"
+# merge_to_main stays forbidden in the INSTANCE default — the draft-PR + human-merge
+# ceiling holds for every repo unless that repo opts in via its own harness.project.toml
+# ([overrides.autonomy] merge_to_main = "gated" | "autonomous").
 merge_to_main = "forbidden"
 force_push = "forbidden"
 

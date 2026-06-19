@@ -83,18 +83,21 @@ def projects(config: Optional[Path] = CONFIG_OPT) -> None:
 
 @app.command()
 def run(
-    loop: str = typer.Argument("demo", help="Loop name: 'demo' or 'dev_task'."),
+    loop: str = typer.Argument("demo", help="Loop: 'demo' | 'dev_task' | 'arch_review' | 'pr_review'."),
     project: str = typer.Argument(..., help="Registered project id."),
     config: Optional[Path] = CONFIG_OPT,
     notifier: Optional[str] = typer.Option(None, help="Override notifier: 'file' or 'console'."),
     issue: Optional[int] = typer.Option(
         None, "--issue", help="dev_task: issue number to work (else claim the next queued)."
     ),
+    pr: Optional[int] = typer.Option(
+        None, "--pr", help="pr_review: PR number to review/merge (else auto-select the next harness PR)."
+    ),
 ) -> None:
     """Create and start a run of LOOP for PROJECT."""
     c = build_container(config, notifier_override=notifier)
     try:
-        record = operations.create_run_for(c, loop=loop, project_id=project, issue=issue)
+        record = operations.create_run_for(c, loop=loop, project_id=project, issue=issue, pr=pr)
     except operations.NotOwned as exc:
         typer.echo(f"refusing: {exc}. Reads are fine; acting is not.", err=True)
         raise typer.Exit(1)
@@ -104,6 +107,8 @@ def run(
 
     if record.data.get("issue_number") is not None:
         typer.echo(f"working issue #{record.data['issue_number']} on {record.data.get('repo')}")
+    if record.data.get("pr_number") is not None:
+        typer.echo(f"reviewing PR #{record.data['pr_number']} on {record.loop_name}")
     typer.echo(f"created run {record.run_id}")
     status = operations.execute_run(c, loop_name=loop, project_id=project, run_id=record.run_id)
     _report(c, record.run_id, status)

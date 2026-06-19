@@ -58,6 +58,7 @@ class SchedulerLedger(BaseModel):
     window_run_ids: list[str] = Field(default_factory=list)   # runs started this window
     last_started: dict[str, float] = Field(default_factory=dict)       # project -> epoch
     last_arch_review: dict[str, float] = Field(default_factory=dict)   # project -> epoch
+    last_pr_review: dict[str, float] = Field(default_factory=dict)     # project -> epoch
     started_count: dict[str, int] = Field(default_factory=dict)        # project -> starts/window
 
 
@@ -130,6 +131,7 @@ class Scheduler:
         halted = window_spend >= sc.global_spend_ceiling_usd
         if not halted:
             started += self._start_dev_tasks(now, ledger)
+            started += self._start_pr_reviews(now, ledger)
             started += self._start_arch_reviews(now, ledger)
 
         self._save_ledger(ledger)
@@ -204,6 +206,48 @@ class Scheduler:
             slots -= 1
             started.append((project.id, record.run_id, status.value))
         return started
+
+    def _start_pr_reviews(self, now: float, ledger: SchedulerLedger) -> list[tuple[str, str, str]]:
+        """Start a pr_review run per owned project that has open work and is due.
+
+        Like dev_task (and unlike the bounded arch_review) a pr_review can suspend on a
+        gated merge, so it respects ``max_concurrent_runs`` and one-active-per-project.
+        Cross-instance/cross-run dedup is structural: selection is scoped to THIS
+        instance's ``harness/<instance>/issue-N`` PRs, so two machines never race.
+        """
+        sc = self.cfg.scheduling
+        instance_id = self.cfg.instance.instance_id
+        active = self._active_runs()
+        active_projects = {r.project_id for r in active}
+        slots = sc.max_concurrent_runs - len(active)
+        out: list[tuple[str, str, str]] = []
+        for project in self.registry.list_owned(instance_id):
+            if slots <= 0:
+                break
+            cadence = project.scheduling.pr_review_cadence_seconds
+            if cadence is None:                              # opt-in; None => never auto-run
+                continue
+            if project.id in active_projects:                # one active run per project
+                continue
+            last = ledger.last_pr_review.get(project.id)     # None => never => due now
+            if last is not None and now - last < cadence:
+                continue
+            if self._window_spend(ledger) >= sc.global_spend_ceiling_usd:
+                break
+            if co.find_reviewable_pr(self.github, repo=project.repo, instance_id=instance_id) is None:
+                continue                                     # nothing to review
+            breakers = self.breakers_factory(project)
+            remaining = sc.global_spend_ceiling_usd - self._window_spend(ledger)
+            breakers.budget_ceiling_usd = min(breakers.budget_ceiling_usd, remaining)
+            runner = self.runner_factory("pr_review", project)
+            record = runner.create_run(project_id=project.id, breakers=breakers)
+            status = runner.run(record.run_id)
+            ledger.last_pr_review[project.id] = now
+            ledger.window_run_ids.append(record.run_id)
+            active_projects.add(project.id)
+            slots -= 1
+            out.append((project.id, record.run_id, status.value))
+        return out
 
     def _start_arch_reviews(self, now: float, ledger: SchedulerLedger) -> list[tuple[str, str, str]]:
         out: list[tuple[str, str, str]] = []

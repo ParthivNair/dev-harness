@@ -9,6 +9,7 @@
 #     PowerShell:  $env:HARNESS_GITHUB_TOKEN = "github_pat_..."
 #     bash/zsh:    export HARNESS_GITHUB_TOKEN="github_pat_..."
 # Use a fine-grained PAT with: Issues=RW, Pull requests=RW, Metadata=R, Contents=RW.
+# (Pull requests=RW is what lets a merge-opted-in repo's pr_review loop merge to main.)
 schema_version = 1
 
 [instance]
@@ -37,9 +38,13 @@ open_draft_pr = "autonomous"
 file_issue = "autonomous"
 set_labels = "autonomous"
 assign_issue = "autonomous"
+review_pr = "autonomous"             # the pr_review loop may post PR reviews/comments
 mark_pr_ready = "gated"
 dependency_change = "gated"
 schema_change = "gated"
+# Keep this "forbidden" here. A repo that wants the pr_review loop to MERGE its PRs opts
+# in PER-REPO in its own harness.project.toml: [overrides.autonomy] merge_to_main =
+# "gated" (review -> human approves merge) | "autonomous" (review -> merge, closed loop).
 merge_to_main = "forbidden"
 force_push = "forbidden"
 

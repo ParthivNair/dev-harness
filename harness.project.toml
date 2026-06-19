@@ -1,6 +1,6 @@
 # The harness as a managed project OF ITSELF (dogfooding). The repo root IS the
-# managed repo, so the dev loop can propose the harness's own next milestone as a
-# DRAFT PR a human merges — it cannot merge, push, or force-push (no port exists).
+# managed repo: the dev loop proposes the harness's own next milestone as a DRAFT PR,
+# and the pr_review loop reviews + (per the opt-in below) MERGES it — closing the loop.
 # The pytest suite is the `test` step, i.e. the self-modification safety net.
 schema_version = 1
 
@@ -20,12 +20,26 @@ cwd = "."
 root = ".harness/prompts"
 dev_task = ".harness/prompts/dev_task.md"
 arch_review = ".harness/prompts/arch_review.md"
+pr_review = ".harness/prompts/pr_review.md"
 
 [scheduling]
 priority = "normal"
 min_poll_interval_seconds = 1800       # at most every 30 min
 loops = ["dev_task"]
 arch_review_cadence_seconds = 86400    # review itself ~daily, files its own tickets
+pr_review_cadence_seconds = 1800       # review + merge its own open PRs every ~30 min
+pr_merge_method = "squash"             # how a merged PR lands on main
+
+# --- Close-the-loop opt-in (overrides the instance default merge_to_main=forbidden) ---
+# This repo authorizes the harness to MERGE its own reviewed PRs to main with no human
+# click ("autonomous"). The hard pre-merge bar still applies: mergeable + green CI + an
+# AI review that approves with no blocking issues, and only PRs on this instance's own
+# harness/<instance>/issue-N branches. Dial back to "gated" to require a human approve on
+# each merge, or remove the line to revert to draft-PR + human-merge.
+# NOTE: still inert until [github].use_in_memory_fake=false (set) AND a token is present
+# AND [scheduling].enabled=true in harness.toml.
+[overrides.autonomy]
+merge_to_main = "autonomous"
 
 [claude]
 model = "claude-opus-4-8"

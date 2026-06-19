@@ -31,11 +31,31 @@ from harness.config.models import (
 from harness.domain.models import BreakerState, RunStatus, VerificationResponse
 from harness.loops.arch_review import build_arch_review_loop
 from harness.loops.dev_task import build_dev_loop
+from harness.loops.pr_review import build_pr_review_loop
+from harness.ports.executor import ClaudeResult
+from harness.ports.github import ChecksState, PRState
 
 pytestmark = pytest.mark.integration
 
 INSTANCE = "this-machine"
-TAXONOMY = {"open_draft_pr": AutonomyTier.AUTONOMOUS, "file_issue": AutonomyTier.AUTONOMOUS}
+TAXONOMY = {
+    "open_draft_pr": AutonomyTier.AUTONOMOUS,
+    "file_issue": AutonomyTier.AUTONOMOUS,
+    "review_pr": AutonomyTier.AUTONOMOUS,
+    "merge_to_main": AutonomyTier.AUTONOMOUS,
+}
+
+
+class ApproveExecutor(EchoExecutor):
+    """Echo executor whose Claude call returns an approving PR-review verdict."""
+
+    def run_claude_task(self, *, project, prompt, json_schema=None) -> ClaudeResult:
+        import json as _json
+
+        return ClaudeResult(
+            result_text=_json.dumps({"recommendation": "approve", "summary": "ok", "blocking": []}),
+            session_id="rev", total_cost_usd=0.01,
+        )
 
 
 class Clock:
@@ -69,12 +89,13 @@ class FakeRegistry:
 
 
 def _project(pid: str, *, priority="normal", weight=None, min_interval=0,
-             arch_cadence=None, loops=("dev_task",)) -> ProjectConfig:
+             arch_cadence=None, pr_review_cadence=None, loops=("dev_task",)) -> ProjectConfig:
     return ProjectConfig(
         id=pid, owner_instance=INSTANCE, repo=f"acme/{pid}",
         scheduling=ProjectScheduling(
             priority=priority, weight=weight, min_poll_interval_seconds=min_interval,
-            arch_review_cadence_seconds=arch_cadence, loops=list(loops),
+            arch_review_cadence_seconds=arch_cadence,
+            pr_review_cadence_seconds=pr_review_cadence, loops=list(loops),
         ),
     )
 
@@ -96,6 +117,11 @@ def _make(tmp_path: Path, projects, *, clock, gh=None, executor=None,
         elif loop_name == "arch_review":
             loop = build_arch_review_loop(
                 executor=executor, github=gh, guard=guard, project=project, project_root=tmp_path,
+            )
+        elif loop_name == "pr_review":
+            loop = build_pr_review_loop(
+                executor=executor, github=gh, guard=guard, project=project,
+                instance_id=INSTANCE, project_root=tmp_path, artifacts_dir=store.root / "art",
             )
         else:
             raise ValueError(loop_name)
@@ -206,6 +232,27 @@ def test_global_spend_ceiling_halts_new_starts(tmp_path: Path) -> None:
     assert report.halted_for_spend is True
     assert report.started == []                       # no new work despite queued issues
     assert co.find_claimable(gh, repo="acme/app", instance_id=INSTANCE) is not None  # work remains
+
+
+def test_pr_review_runs_on_cadence_and_closes_the_loop(tmp_path: Path) -> None:
+    clock = Clock(1000.0)
+    proj = _project("app", pr_review_cadence=3600)  # auto review+merge its own PRs ~hourly
+    sched, gh, store, _ = _make(tmp_path, [proj], clock=clock, executor=ApproveExecutor())
+    # An open, mergeable, green-CI harness PR authored by THIS instance.
+    issue = gh.create_issue(repo="acme/app", title="x", body="",
+                            labels=[co.IN_PROGRESS, co.owner_label(INSTANCE)])
+    pr = gh.open_draft_pr(repo="acme/app", head=f"harness/{INSTANCE}/issue-{issue.number}",
+                          base="main", title="x", body="")
+    gh.set_pull(repo="acme/app", number=pr.number, mergeable=True)
+    gh.set_pull_checks(repo="acme/app", number=pr.number, state=ChecksState.SUCCESS)
+
+    report = sched.tick()
+    assert any(pid == "app" for pid, _, _ in report.started)            # a pr_review run started
+    assert gh.get_pull(repo="acme/app", number=pr.number).state is PRState.MERGED
+    assert co.state_of(gh.get_issue(repo="acme/app", number=issue.number)) == co.DONE
+
+    clock.t = 1000.0 + 1800                                             # under cadence, PR gone
+    assert sched.tick().started == []                                   # nothing to do
 
 
 def test_arch_review_runs_on_its_own_cadence(tmp_path: Path) -> None:

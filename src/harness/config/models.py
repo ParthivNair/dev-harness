@@ -147,6 +147,7 @@ class PromptSet(BaseModel):
     root: str = ".harness/prompts"
     dev_task: Optional[str] = None
     arch_review: Optional[str] = None
+    pr_review: Optional[str] = None
 
 
 class ClaudeConfig(BaseModel):
@@ -175,6 +176,9 @@ class ProjectScheduling(BaseModel):
     min_poll_interval_seconds: int = 900       # minimum gap between starts for this project
     loops: list[str] = Field(default_factory=lambda: ["dev_task"])
     arch_review_cadence_seconds: Optional[int] = None  # None => never auto-run arch_review
+    pr_review_cadence_seconds: Optional[int] = None    # None => never auto-run pr_review
+    # How a merged PR lands on the base branch. Only used when merge_to_main is opted in.
+    pr_merge_method: Literal["squash", "merge", "rebase"] = "squash"
 
     def effective_weight(self, default: float = 1.0) -> float:
         if self.weight is not None:

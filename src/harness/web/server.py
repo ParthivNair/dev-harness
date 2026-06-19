@@ -61,6 +61,7 @@ class StartBody(BaseModel):
     loop: str
     project: str
     issue: Optional[int] = None
+    pr: Optional[int] = None
 
 
 def _default_background(fn: Callable[[], Any]) -> None:
@@ -160,7 +161,7 @@ def create_app(
         _require_actions()
         try:
             record = operations.create_run_for(
-                container, loop=body.loop, project_id=body.project, issue=body.issue
+                container, loop=body.loop, project_id=body.project, issue=body.issue, pr=body.pr
             )
         except operations.NotOwned as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from None

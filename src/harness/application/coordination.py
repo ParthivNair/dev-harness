@@ -20,6 +20,7 @@ is not).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -42,6 +43,12 @@ STATE_LABELS = frozenset(
     {QUEUED, IN_PROGRESS, NEEDS_VERIFICATION, PR_OPEN, BLOCKED, DONE}
 )
 OWNER_PREFIX = "harness:owner:"
+
+# A non-state marker applied to a PULL (not an issue): the pr_review loop tags a PR
+# it reviewed but would not merge (changes requested, failing CI, or unmergeable), so
+# the next selection pass skips it instead of re-reviewing the same unchanged PR.
+# Deliberately NOT in STATE_LABELS — it lives on PRs, outside the issue state machine.
+CHANGES_REQUESTED = "harness:changes-requested"
 
 
 def owner_label(instance_id: str) -> str:
@@ -181,3 +188,27 @@ def find_claimable(
     if not candidates:
         return None
     return min(i.number for i in candidates)
+
+
+def harness_branch_issue(head: Optional[str], instance_id: str) -> Optional[int]:
+    """The issue number encoded in a head branch ``harness/<instance_id>/issue-N``,
+    or None if the branch is not one THIS instance authored. The single source of
+    truth for "is this PR ours to review/merge" — instance-scoped so two machines
+    never race and a human's branch is never matched."""
+    m = re.match(rf"^harness/{re.escape(instance_id)}/issue-(\d+)$", head or "")
+    return int(m.group(1)) if m else None
+
+
+def find_reviewable_pr(
+    github: GitHubAdapter, *, repo: str, instance_id: str
+) -> Optional[int]:
+    """Lowest open PR authored by THIS instance (``harness/<instance>/issue-N``) that
+    is not already flagged :data:`CHANGES_REQUESTED`. The pr_review analogue of
+    :func:`find_claimable`; returns the PR number, or None if there's nothing to review."""
+    numbers = [
+        pr.number
+        for pr in github.list_pulls(repo=repo, state="open")
+        if CHANGES_REQUESTED not in pr.labels
+        and harness_branch_issue(pr.head, instance_id) is not None
+    ]
+    return min(numbers) if numbers else None
