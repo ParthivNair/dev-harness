@@ -44,6 +44,19 @@ class FindingsExecutor(EchoExecutor):
         )
 
 
+class NonJsonExecutor(EchoExecutor):
+    """Returns non-JSON text (e.g. a rate-limit message) as a degraded `claude` call would."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+
+    def run_claude_task(
+        self, *, project: ProjectConfig, prompt: str, json_schema: Optional[dict[str, Any]] = None
+    ) -> ClaudeResult:
+        return ClaudeResult(result_text=self._text, session_id="arch-1", total_cost_usd=0.02)
+
+
 def _run(gh: InMemoryGitHub, executor, tmp_path: Path) -> tuple[AtomicJsonRunStore, RunStatus]:
     store = AtomicJsonRunStore(tmp_path / "state")
     loop = build_arch_review_loop(
@@ -90,3 +103,16 @@ def test_dedupes_against_existing_queue(tmp_path: Path) -> None:
     open_issues = gh.list_issues(repo=REPO, state="open", labels=[co.QUEUED])
     titles = sorted(i.title for i in open_issues)
     assert titles == ["Fresh issue", "Known issue"]  # no duplicate "Known issue"
+
+
+def test_non_json_scan_result_is_preserved(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    # A rate-limit / truncated response is non-JSON: it parses as zero findings
+    # (clean exit), but the raw text must survive so `harness show` can diagnose it.
+    raw = "Error: rate limit exceeded, please retry"
+    store, status = _run(gh, NonJsonExecutor(raw), tmp_path)
+    assert status is RunStatus.COMPLETED
+    filed = gh.list_issues(repo=REPO, state="open", labels=[co.QUEUED])
+    assert len(filed) == 0
+    (record,) = store.list()
+    assert record.data["raw_scan_result"] == raw

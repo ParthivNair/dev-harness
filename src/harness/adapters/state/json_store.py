@@ -17,6 +17,7 @@ from harness.ports.run_store import (
     IncompatibleSchema,
     RunAlreadyExists,
     RunNotFound,
+    VersionConflict,
 )
 from harness.util.atomic import atomic_write_text
 
@@ -53,7 +54,18 @@ class AtomicJsonRunStore:
     def save(self, record: RunRecord) -> None:
         record.updated_at = utcnow_iso()
         record.machine_id = MACHINE_ID
-        atomic_write_text(self._path(record.run_id), record.model_dump_json(indent=2))
+        path = self._path(record.run_id)
+        if path.exists():
+            # Compare-and-set: the version loaded must still be on disk, else a
+            # concurrent writer raced us. .get(..., 0) keeps pre-version files compatible.
+            disk_version = json.loads(path.read_text("utf-8")).get("version", 0)
+            if disk_version != record.version:
+                raise VersionConflict(
+                    f"run {record.run_id} changed on disk: expected version "
+                    f"{record.version}, found {disk_version}"
+                )
+            record.version += 1
+        atomic_write_text(path, record.model_dump_json(indent=2))
 
     def exists(self, run_id: str) -> bool:
         return self._path(run_id).exists()

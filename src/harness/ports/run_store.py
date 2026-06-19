@@ -28,6 +28,11 @@ class IncompatibleSchema(RunStoreError):
     """The stored document's schema_version is newer than this engine understands."""
 
 
+class VersionConflict(RunStoreError):
+    """The on-disk record was modified since it was loaded (optimistic-concurrency
+    compare-and-set failed). The caller should reload and retry."""
+
+
 @runtime_checkable
 class RunStore(Protocol):
     def create(self, record: RunRecord) -> None:
@@ -37,7 +42,13 @@ class RunStore(Protocol):
         """Load and deserialize. Raises :class:`RunNotFound` / :class:`IncompatibleSchema`."""
 
     def save(self, record: RunRecord) -> None:
-        """Atomically overwrite the run document (stamps updated_at + machine_id)."""
+        """Atomically overwrite the run document (stamps updated_at + machine_id).
+
+        Optimistic-concurrency compare-and-set: ``record.version`` is the version
+        observed when the record was loaded. If the on-disk version no longer
+        matches, another writer raced us — :class:`VersionConflict` is raised and
+        the file is left untouched. On success ``record.version`` is bumped to the
+        version now persisted, so the same instance can be saved again."""
 
     def exists(self, run_id: str) -> bool:
         ...

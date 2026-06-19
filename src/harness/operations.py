@@ -31,6 +31,7 @@ from harness.domain.models import (
     VerificationResponse,
     utcnow_iso,
 )
+from harness.ports.github import IssueRef
 from harness.ports.project_registry import ProjectNotFound
 from harness.ports.run_store import RunNotFound
 
@@ -153,6 +154,23 @@ def abort_run(c: Container, *, run_id: str, reason: str = "aborted by operator")
     c.store.save(record)
     mark_blocked_if_aborted(c, run_id, RunStatus.ABORTED)
     return RunStatus.ABORTED
+
+
+def cancel_issue(c: Container, *, project_id: str, number: int) -> IssueRef:
+    """Release an issue's lease and requeue it — the operator-facing inverse of claim.
+
+    Guarded by the same ownership check as :func:`create_run_for`: reading another
+    install's project is fine, acting on it is not. Touches GitHub labels ONLY (drops
+    the owner lease, sets ``harness:queued``); it does not abort a local run for that
+    issue. Idempotent: releasing an already-queued or unowned issue is a no-op relabel.
+    """
+    proj = c.registry.get(project_id)
+    if not owns(proj, c.cfg.instance):
+        raise NotOwned(
+            f"instance '{c.cfg.instance.instance_id}' does not own project "
+            f"'{project_id}' (owner: {proj.owner_instance})"
+        )
+    return co.release(c.github, repo=proj.repo, number=number)
 
 
 def tick_once(c: Container) -> TickReport:

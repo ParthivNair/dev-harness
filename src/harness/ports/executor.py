@@ -14,6 +14,13 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from harness.config.models import ProjectConfig
 
 
+class ExecutorError(RuntimeError):
+    """Raised by an Executor when the work itself fails in a way the engine should
+    react to (e.g. a guarded ``publish_branch`` refuses a branch, finds nothing to
+    commit, or a git command errors). Part of the port contract so the engine can
+    catch it without importing an adapter."""
+
+
 @dataclass(frozen=True)
 class CommandResult:
     exit_code: int

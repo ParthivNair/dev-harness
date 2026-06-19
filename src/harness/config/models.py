@@ -175,6 +175,7 @@ class ProjectScheduling(BaseModel):
     min_poll_interval_seconds: int = 900       # minimum gap between starts for this project
     loops: list[str] = Field(default_factory=lambda: ["dev_task"])
     arch_review_cadence_seconds: Optional[int] = None  # None => never auto-run arch_review
+    max_findings_per_run: Optional[int] = None  # cap issues filed per arch_review run; None => no cap
 
     def effective_weight(self, default: float = 1.0) -> float:
         if self.weight is not None:

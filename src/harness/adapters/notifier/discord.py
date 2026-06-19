@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 from harness.adapters.notifier.file import FileNotifier
@@ -26,6 +28,10 @@ from harness.domain.models import VerificationRequest, VerificationResponse
 
 # Discord button styles (wire values).
 _STYLES = {"primary": 1, "secondary": 2, "success": 3, "danger": 4}
+
+# An artifact bigger than this is left as a text path rather than uploaded (Discord
+# rejects oversized files; the gate must still post). Test logs are tiny; this is a guard.
+_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -108,6 +114,54 @@ def to_discord_payload(post: GatePost) -> dict:
             ],
         }]
     return body
+
+
+def _readable_artifact(post: GatePost, *, max_bytes: int) -> Optional[tuple[str, bytes]]:
+    """The artifact's ``(filename, bytes)`` iff ``artifact_path`` is set, the file
+    exists, and it fits under ``max_bytes`` — else None (the post degrades to text)."""
+    if not post.artifact_path:
+        return None
+    path = Path(post.artifact_path)
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    if len(data) > max_bytes:
+        return None
+    return path.name, data
+
+
+def encode_create_message(
+    post: GatePost, *, boundary: str, max_artifact_bytes: int = _MAX_ARTIFACT_BYTES
+) -> tuple[bytes, str]:
+    """Render a GatePost into a Discord create-message request body + Content-Type.
+
+    With a usable artifact, builds ``multipart/form-data``: a ``payload_json`` part
+    (reusing :func:`to_discord_payload`, with the file declared in ``attachments``)
+    plus a ``files[0]`` part carrying the bytes. Without one (no path, missing file,
+    or oversized), falls back to the plain JSON body — the path stays in ``content``.
+    """
+    artifact = _readable_artifact(post, max_bytes=max_artifact_bytes)
+    if artifact is None:
+        return json.dumps(to_discord_payload(post)).encode("utf-8"), "application/json"
+    filename, content = artifact
+    payload = to_discord_payload(post)
+    payload["attachments"] = [{"id": 0, "filename": filename}]
+    delim = f"--{boundary}".encode("utf-8")
+    body = b"\r\n".join([
+        delim,
+        b'Content-Disposition: form-data; name="payload_json"',
+        b"Content-Type: application/json",
+        b"",
+        json.dumps(payload).encode("utf-8"),
+        delim,
+        f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"'.encode("utf-8"),
+        b"Content-Type: application/octet-stream",
+        b"",
+        content,
+        f"--{boundary}--".encode("utf-8"),
+        b"",
+    ])
+    return body, f"multipart/form-data; boundary={boundary}"
 
 
 # --------------------------------------------------------------------------- #

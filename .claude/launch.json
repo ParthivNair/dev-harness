@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "harness-dashboard-demo",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "python", "scripts/dev_dashboard_demo.py"],
+      "port": 8799
+    },
+    {
+      "name": "harness-ui-live",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "harness", "ui", "--no-browser"],
+      "port": 8765
+    }
+  ]
+}

@@ -44,6 +44,9 @@ ARCH_FINDINGS_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Severity ordering for the per-run cap: high files before med before low.
+_SEVERITY_RANK = {"low": 1, "med": 2, "high": 3}
+
 DEFAULT_RUBRIC = (
     "Review this codebase against its architecture rubric. Report concrete, "
     "actionable findings only (no praise, no speculation). For each, give a short "
@@ -84,6 +87,7 @@ def build_arch_review_loop(
 ) -> LoopDefinition:
     rubric = _read_rubric(project_root, project)
     repo = project.repo
+    max_per_run = project.scheduling.max_findings_per_run
 
     def scan(ctx: RunContext) -> StepOutcome:
         result = executor.run_claude_task(
@@ -93,7 +97,7 @@ def build_arch_review_loop(
         findings = _parse_findings(result.result_text)
         return StepOutcome(
             next_step="assess",
-            state_patch={"findings": findings},
+            state_patch={"findings": findings, "raw_scan_result": result.result_text},
             output={"count": len(findings)},
         )
 
@@ -107,27 +111,39 @@ def build_arch_review_loop(
         findings = ctx.data.get("findings") or []
         # Dedupe by title against the open queue so repeated reviews don't pile up.
         existing = {i.title for i in github.list_issues(repo=repo, state="open", labels=[co.QUEUED])}
-        filed: list[int] = []
         skipped: list[str] = []
+        new: list[dict] = []
         for f in findings:
             title = f.get("title", "untitled finding")
             if title in existing:
-                skipped.append(title)
+                skipped.append(title)  # "skipped" stays duplicate-title only
                 continue
+            new.append(f)
+            existing.add(title)
+        # Cap per run, highest-severity first. A stable sort keeps the model's order
+        # within a severity, so it breaks ties. Findings past the cap are deferred
+        # (eligible to file, cut by the cap) — a different bucket than dedup skips.
+        if max_per_run is not None:
+            new.sort(key=lambda f: _SEVERITY_RANK.get(f.get("severity", "low"), 0), reverse=True)
+            to_file, deferred_findings = new[:max_per_run], new[max_per_run:]
+        else:
+            to_file, deferred_findings = new, []
+        filed: list[int] = []
+        for f in to_file:
             guard.admit(ActionRequest("file_issue", project.id))  # autonomous tier
             sev = f.get("severity", "low")
             issue = github.create_issue(
                 repo=repo,
-                title=title,
+                title=f.get("title", "untitled finding"),
                 body=f.get("rationale", ""),
                 labels=[co.QUEUED, f"sev:{sev}"],
             )
             filed.append(issue.number)
-            existing.add(title)
+        deferred = [f.get("title", "untitled finding") for f in deferred_findings]
         return StepOutcome(
             next_step="finish",
-            state_patch={"filed": filed, "skipped": skipped},
-            output={"filed": filed, "skipped": skipped},
+            state_patch={"filed": filed, "skipped": skipped, "deferred": deferred},
+            output={"filed": filed, "skipped": skipped, "deferred": deferred},
         )
 
     def finish(ctx: RunContext) -> StepOutcome:

@@ -165,6 +165,7 @@ class RunRecord(BaseModel):
     updated_at: str = Field(default_factory=utcnow_iso)
     terminal_reason: Optional[str] = None
     machine_id: str = ""
+    version: int = 0  # monotonic CAS token; bumped by RunStore.save on each write
 
 
 __all__ = [
