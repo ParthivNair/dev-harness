@@ -100,6 +100,33 @@ def test_no_queued_work_raises(tmp_path: Path) -> None:
         operations.create_run_for(c, loop="dev_task", project_id="sample")
 
 
+def test_init_labels_creates_full_state_set(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    c = make_container(tmp_path, repo=REPO, github=gh)
+    created = operations.init_labels(c, project_id="sample")
+    # every harness state label is created on a fresh repo, in deterministic order
+    assert set(created) == set(co.STATE_LABELS)
+    assert created == sorted(co.STATE_LABELS)
+    assert gh._labels[REPO] == set(co.STATE_LABELS)
+
+
+def test_init_labels_is_idempotent_second_run_creates_nothing(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    c = make_container(tmp_path, repo=REPO, github=gh)
+    operations.init_labels(c, project_id="sample")
+    again = operations.init_labels(c, project_id="sample")  # clean no-op, no error
+    assert again == []
+    assert gh._labels[REPO] == set(co.STATE_LABELS)
+
+
+def test_init_labels_refuses_for_unowned_project(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    c = make_container(tmp_path, instance="this-machine", owner="other-machine", github=gh)
+    with pytest.raises(operations.NotOwned):
+        operations.init_labels(c, project_id="sample")
+    assert gh._labels == {}  # refused before any write
+
+
 def test_cancel_issue_releases_lease_and_requeues(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
     number = gh.create_issue(repo=REPO, title="t", body="x", labels=[co.QUEUED, "bug"]).number
