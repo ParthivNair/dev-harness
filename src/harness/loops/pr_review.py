@@ -314,14 +314,24 @@ def build_pr_review_loop(
         merged = github.merge_pull(repo=repo, number=pr_number, method=project.scheduling.pr_merge_method)
 
         # Best-effort: flip each issue aggregated into this wave PR from PR_OPEN to DONE,
-        # so the overseer's reconcile never re-queues already-merged work. The included
-        # issues are the checked rows of the overseer's wave-PR body. Advisory — a
-        # labeling failure never unmerges the PR — but it IS recorded (not silently
-        # swallowed) so a stuck issue is visible to the dashboard / `harness show`.
-        issues = _merged_issue_numbers(pr.body)
+        # so the overseer's reconcile never re-queues already-merged work. The candidates
+        # are the checked rows of the overseer's wave-PR body, but we ONLY complete an
+        # issue actually in the published-awaiting-merge state we own (PR_OPEN + our lease)
+        # — so a hand-edited wave body can't flip arbitrary/unrelated issues to DONE.
+        # Advisory: a labeling failure never unmerges the PR, but it IS recorded (not
+        # silently swallowed) so a stuck issue is visible to the dashboard / `harness show`.
         done: list[int] = []
+        skipped: list[int] = []
         failed: dict[int, str] = {}
-        for number in issues:
+        for number in _merged_issue_numbers(pr.body):
+            try:
+                issue = github.get_issue(repo=repo, number=number)
+            except Exception:  # noqa: BLE001 — a referenced issue that doesn't exist
+                skipped.append(number)
+                continue
+            if co.owner_of(issue) != instance_id or co.state_of(issue) != co.PR_OPEN:
+                skipped.append(number)  # not one of our published-awaiting-merge issues
+                continue
             try:
                 co.transition(github, repo=repo, number=number, to_state=co.DONE)
                 done.append(number)
@@ -331,7 +341,7 @@ def build_pr_review_loop(
             next_step=None,
             state_patch={"merged": True, "pr_merged_ref": merged.url},
             output={"merged": True, "pr_url": merged.url, "issues_done": done,
-                    "issues_failed": failed or None},
+                    "issues_skipped": skipped or None, "issues_failed": failed or None},
         )
 
     return LoopDefinition(

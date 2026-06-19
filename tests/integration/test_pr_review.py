@@ -166,6 +166,31 @@ def test_skipped_issue_in_wave_body_is_not_marked_done(tmp_path: Path) -> None:
     assert co.state_of(gh.get_issue(repo=REPO, number=skipped)) == co.PR_OPEN
 
 
+def test_body_referencing_a_non_pr_open_issue_is_not_marked_done(tmp_path: Path) -> None:
+    """Defense in depth: a checked body row for an issue that is NOT one of our
+    published-awaiting-merge (PR_OPEN, owned) issues must be skipped, not flipped — so a
+    hand-edited wave body can't mark arbitrary issues DONE."""
+    from dataclasses import replace
+
+    gh = InMemoryGitHub()
+    pr_no, included = _seed_wave_pr(gh, issue_count=1)  # one legit PR_OPEN issue
+    # A foreign issue: open + QUEUED (not PR_OPEN), not aggregated by us, injected into body.
+    foreign = gh.create_issue(repo=REPO, title="unrelated", body="", labels=[co.QUEUED]).number
+    pr = gh.get_pull(repo=REPO, number=pr_no)
+    gh._pulls[(REPO, pr_no)] = replace(
+        pr, body=pr.body + f"\n- [x] #{foreign} — injected (`harness/{INSTANCE}/issue-{foreign}`)"
+    )
+    store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
+
+    run_id = _create(runner)
+    assert runner.run(run_id) is RunStatus.COMPLETED
+    assert gh.get_pull(repo=REPO, number=pr_no).state is PRState.MERGED
+    assert co.state_of(gh.get_issue(repo=REPO, number=included[0])) == co.DONE   # legit -> done
+    assert co.state_of(gh.get_issue(repo=REPO, number=foreign)) == co.QUEUED     # foreign untouched
+    out = store.load(run_id).step_log["merge#1"].output
+    assert foreign in (out["issues_skipped"] or [])
+
+
 def test_request_changes_posts_review_labels_and_does_not_merge(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
     pr_no, issues = _seed_wave_pr(gh)
