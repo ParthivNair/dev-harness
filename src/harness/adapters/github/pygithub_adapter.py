@@ -59,6 +59,7 @@ def _to_pull_ref(pr: Any) -> PullRef:
         labels=tuple(label.name for label in pr.labels),
         url=pr.html_url,
         head=head,
+        body=pr.body or "",
     )
 
 
@@ -170,6 +171,9 @@ class PyGithubAdapter:
         issue = self._repo(repo).get_issue(number)
         issue.add_to_assignees(assignee)
         return _to_issue_ref(self._repo(repo).get_issue(number))
+
+    def comment_on_issue(self, *, repo: str, number: int, body: str) -> None:
+        self._repo(repo).get_issue(number).create_comment(body)
 
     def open_draft_pr(
         self, *, repo: str, head: str, base: str, title: str, body: str

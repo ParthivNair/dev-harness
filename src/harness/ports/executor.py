@@ -27,6 +27,20 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class WaveAssembly:
+    """Result of aggregating a wave's per-issue branches onto one wave branch.
+
+    ``included``/``skipped`` are the source branch names that cherry-picked cleanly
+    vs. those dropped on conflict, so the overseer can report what made the PR.
+    """
+
+    branch: str
+    head_sha: str
+    included: list[str]
+    skipped: list[str]
+
+
+@dataclass(frozen=True)
 class ClaudeResult:
     result_text: str
     session_id: Optional[str]
@@ -59,3 +73,19 @@ class Executor(Protocol):
         implementations MUST refuse ``main``/``master`` and MUST NOT force-push. The
         GitHubAdapter still has no merge/push — only this guarded feature-branch push
         exists, and a human still merges."""
+
+    def assemble_wave_branch(
+        self,
+        *,
+        project: ProjectConfig,
+        wave_branch: str,
+        source_branches: list[str],
+        base: str = "origin/main",
+    ) -> WaveAssembly:
+        """Aggregate one wave's per-issue ``source_branches`` onto ``wave_branch``.
+
+        Branch ``wave_branch`` from ``base`` and cherry-pick each source branch's
+        ``base..<branch>`` commits onto it, skipping (and recording) any branch that
+        conflicts, then push the wave branch so a single draft PR can reference it.
+        Like ``publish_branch`` this is a guarded namespaced-branch push only — never
+        a trunk, never a force-push, and the GitHubAdapter still has no merge."""

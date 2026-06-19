@@ -79,7 +79,8 @@ class PullRef:
     mergeable: Optional[bool]  # None-safe: GitHub computes this asynchronously
     labels: tuple[str, ...]
     url: str
-    head: str = ""  # head branch ref, e.g. "harness/<instance>/issue-7" (default-last, additive)
+    head: str = ""  # head branch ref, e.g. "harness/<instance>/wave-ab12cd" (default-last, additive)
+    body: str = ""  # PR description — pr_review reads a wave PR's body to find its issues
 
 
 @runtime_checkable
@@ -126,6 +127,9 @@ class GitHubAdapter(Protocol):
 
     def assign_issue(self, *, repo: str, number: int, assignee: str) -> IssueRef: ...
 
+    def comment_on_issue(self, *, repo: str, number: int, body: str) -> None:
+        """Post a comment on an issue (visibility + the cross-machine handoff trail)."""
+
     def open_draft_pr(
         self, *, repo: str, head: str, base: str, title: str, body: str
     ) -> PullRef:
@@ -137,10 +141,15 @@ class GitHubAdapter(Protocol):
         """Post a PR review (APPROVE / REQUEST_CHANGES / COMMENT). Low-risk write —
         autonomy action ``review_pr`` (autonomous by default; a repo may forbid it)."""
 
-    # ---- GATED / OPT-IN WRITES — must pass the ActionGuard ----
+    # ---- GATED / OPT-IN WRITES (gated by default) — must pass the ActionGuard ----
     def mark_pr_ready(self, *, repo: str, number: int) -> PullRef:
-        """Draft -> ready-for-review (GraphQL under the hood). Crosses into human
-        territory, so the engine routes it through the gate, never autonomously."""
+        """Draft -> ready-for-review (GraphQL under the hood).
+
+        Gated by DEFAULT: for a human-reviewed repo this crosses into human territory,
+        so the engine routes it through a gate. A SELF-MANAGED project may override
+        ``mark_pr_ready`` to autonomous in its ``[overrides.autonomy]`` so the overseer
+        promotes its aggregated wave PR to ready for the pr_review agent to pick up.
+        Merge stays a SEPARATE per-repo opt-in (``merge_to_main``) via ``merge_pull``."""
 
     def merge_pull(
         self, *, repo: str, number: int, method: str = "squash"

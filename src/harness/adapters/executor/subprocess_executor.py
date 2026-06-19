@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from harness.config.models import ProjectConfig
-from harness.ports.executor import ClaudeResult, CommandResult
+from harness.ports.executor import ClaudeResult, CommandResult, WaveAssembly
 
 
 class ExecutorError(RuntimeError):
@@ -41,6 +42,16 @@ class SubprocessExecutor:
     def _as_argv(command: list[str] | str) -> list[str]:
         return command if isinstance(command, list) else command.split()
 
+    @staticmethod
+    def _guard_feature_branch(branch: str) -> None:
+        """Structural guardrail: a namespaced feature branch ONLY. Refuse trunks and
+        anything not clearly a feature branch; never force-push anywhere."""
+        if branch in _PROTECTED_BRANCHES or "/" not in branch:
+            raise ExecutorError(
+                f"refusing to publish '{branch}': only namespaced feature branches "
+                f"(e.g. 'harness/<instance>/issue-N') may be pushed, never a trunk"
+            )
+
     def _run(self, argv: list[str], cwd: Path) -> CommandResult:
         start = time.monotonic()
         proc = subprocess.run(
@@ -65,13 +76,7 @@ class SubprocessExecutor:
     def publish_branch(
         self, *, project: ProjectConfig, branch: str, commit_message: str
     ) -> CommandResult:
-        # Structural guardrail: a namespaced feature branch ONLY. Refuse trunks and
-        # anything not clearly a feature branch; never force-push anywhere.
-        if branch in _PROTECTED_BRANCHES or "/" not in branch:
-            raise ExecutorError(
-                f"refusing to publish '{branch}': only namespaced feature branches "
-                f"(e.g. 'harness/<instance>/issue-N') may be pushed, never a trunk"
-            )
+        self._guard_feature_branch(branch)
         cwd = self._cwd(project)
         # Create/reset the feature branch at HEAD (working-tree edits are preserved),
         # commit everything, and push WITHOUT --force. A human still merges.
@@ -83,6 +88,88 @@ class SubprocessExecutor:
         if not commit.ok:
             raise ExecutorError(f"git commit failed ({commit.exit_code}): {commit.stderr[:300]}")
         return self._git(["push", "-u", "origin", branch], cwd)
+
+    def assemble_wave_branch(
+        self,
+        *,
+        project: ProjectConfig,
+        wave_branch: str,
+        source_branches: list[str],
+        base: str = "origin/main",
+    ) -> WaveAssembly:
+        # Same push guard as publish_branch: a namespaced feature branch ONLY.
+        self._guard_feature_branch(wave_branch)
+        repo_root = self._cwd(project)
+        self._git(["fetch", "origin"], repo_root)
+
+        # Do the assembly in a throwaway worktree so the project's working tree and
+        # checked-out branch are never disturbed (cherry-picks happen off in temp).
+        with tempfile.TemporaryDirectory(prefix="harness-wave-") as tmp:
+            wt = Path(tmp) / "wt"
+            # Pre-clean any stale local ref so a retry after a crashed run is idempotent
+            # (the temp worktree is gone but the branch could survive — A6).
+            self._run(["git", "worktree", "remove", "--force", str(wt)], repo_root)
+            self._run(["git", "branch", "-D", wave_branch], repo_root)
+            # Create the wave branch at `base` and check it out in the temp worktree.
+            self._git(["worktree", "add", "-b", wave_branch, str(wt), base], repo_root)
+            try:
+                included, skipped = self._cherry_pick_branches(
+                    wt, base=base, source_branches=source_branches
+                )
+                # Guarded push (no --force); a human still merges the draft PR.
+                self._git(["push", "-u", "origin", wave_branch], wt)
+                head = self._git(["rev-parse", "HEAD"], wt).stdout.strip()
+            finally:
+                # Always detach the temp worktree AND delete the local branch — the
+                # branch now lives in origin, and a surviving local ref would wedge the
+                # next attempt at "branch already exists" (A6).
+                self._run(["git", "worktree", "remove", "--force", str(wt)], repo_root)
+                self._run(["git", "branch", "-D", wave_branch], repo_root)
+        return WaveAssembly(
+            branch=wave_branch, head_sha=head, included=included, skipped=skipped
+        )
+
+    def _cherry_pick_branches(
+        self, wt: Path, *, base: str, source_branches: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """Cherry-pick each source branch's own commits onto the wave branch, one
+        commit at a time, in the given order.
+
+        Picking ``base..branch`` as a single range double-applies the commits a
+        STACKED branch shares with an earlier source (issue-13 ⊂ issue-5 ⊂ …), which
+        conflicts and drops everything but the first branch. Instead we replay
+        ``rev-list --reverse base..branch`` commit-by-commit: a commit already on the
+        wave branch cherry-picks empty (``--skip``), a genuinely new one applies, and
+        only a real content conflict aborts THIS branch (recorded in ``skipped``) while
+        leaving the wave intact for the rest. Correct for both independent (post-#18)
+        and stacked branches."""
+        included: list[str] = []
+        skipped: list[str] = []
+        for branch in source_branches:
+            commits = self._git(
+                ["rev-list", "--reverse", f"{base}..{branch}"], wt
+            ).stdout.split()
+            conflicted = False
+            for sha in commits:
+                pick = self._run(["git", "cherry-pick", sha], wt)
+                if pick.ok:
+                    continue
+                combined = (pick.stdout + pick.stderr).lower()
+                # An empty pick = the commit is already applied (a shared ancestor of a
+                # stacked branch). Skip it and keep replaying the branch.
+                if "empty" in combined or "nothing to commit" in combined:
+                    self._run(["git", "cherry-pick", "--skip"], wt)
+                    continue
+                # A real conflict: abandon just this branch, recover the wave tree, and
+                # move on so the remaining branches can still aggregate.
+                self._run(["git", "cherry-pick", "--abort"], wt)
+                conflicted = True
+                break
+            if conflicted:
+                skipped.append(branch)
+            else:
+                included.append(branch)
+        return included, skipped
 
     def _git(self, args: list[str], cwd: Path) -> CommandResult:
         result = self._run(["git", *args], cwd)

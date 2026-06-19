@@ -23,37 +23,38 @@ INSTANCE = "win-desktop"
 @pytest.mark.parametrize(
     "head,expected",
     [
-        ("harness/win-desktop/issue-7", 7),
-        ("harness/win-desktop/issue-123", 123),
-        ("harness/other-machine/issue-7", None),   # different instance
-        ("feature/win-desktop/issue-7", None),     # not a harness branch
-        ("harness/win-desktop/issue-7x", None),    # trailing junk
-        ("harness/win-desktop/hotfix", None),      # no issue-N
-        ("", None),
-        (None, None),
+        ("harness/win-desktop/wave-ab12cd", True),
+        ("harness/win-desktop/wave-0", True),
+        ("harness/other-machine/wave-ab12cd", False),   # different instance
+        ("harness/win-desktop/issue-7", False),         # a per-issue branch, not a wave
+        ("feature/win-desktop/wave-ab12cd", False),     # not a harness branch
+        ("", False),
+        (None, False),
     ],
 )
-def test_harness_branch_issue_is_instance_scoped(head, expected) -> None:
-    assert co.harness_branch_issue(head, INSTANCE) == expected
+def test_is_harness_wave_pr_is_instance_scoped(head, expected) -> None:
+    assert co.is_harness_wave_pr(head, INSTANCE) is expected
 
 
-def test_find_reviewable_pr_picks_lowest_own_unflagged_open_pr() -> None:
+def test_find_reviewable_pr_picks_lowest_own_unflagged_wave_pr() -> None:
     gh = InMemoryGitHub()
-    # ours, reviewable (two — expect the lower number)
-    a = gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/issue-1", base="main", title="a", body="")
-    b = gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/issue-2", base="main", title="b", body="")
-    # excluded: another instance, a human branch, and one we already flagged
-    gh.open_draft_pr(repo=REPO, head="harness/other/issue-3", base="main", title="c", body="")
-    gh.open_draft_pr(repo=REPO, head="feature/x", base="main", title="d", body="")
-    flagged = gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/issue-4", base="main", title="e", body="")
+    # ours, reviewable wave PRs (two — expect the lower number)
+    a = gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/wave-aaa", base="main", title="a", body="")
+    b = gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/wave-bbb", base="main", title="b", body="")
+    # excluded: another instance's wave, a per-issue branch, a human branch, a flagged wave
+    gh.open_draft_pr(repo=REPO, head="harness/other/wave-ccc", base="main", title="c", body="")
+    gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/issue-3", base="main", title="d", body="")
+    gh.open_draft_pr(repo=REPO, head="feature/x", base="main", title="e", body="")
+    flagged = gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/wave-ddd", base="main", title="f", body="")
     gh.add_labels(repo=REPO, number=flagged.number, labels=[co.CHANGES_REQUESTED])
 
     assert co.find_reviewable_pr(gh, repo=REPO, instance_id=INSTANCE) == min(a.number, b.number)
 
 
-def test_find_reviewable_pr_none_when_no_own_work() -> None:
+def test_find_reviewable_pr_none_when_no_own_wave() -> None:
     gh = InMemoryGitHub()
-    gh.open_draft_pr(repo=REPO, head="harness/other/issue-1", base="main", title="x", body="")
+    gh.open_draft_pr(repo=REPO, head="harness/other/wave-aaa", base="main", title="x", body="")
+    gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/issue-1", base="main", title="y", body="")
     assert co.find_reviewable_pr(gh, repo=REPO, instance_id=INSTANCE) is None
 
 

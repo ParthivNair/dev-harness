@@ -1,7 +1,9 @@
 # dev-harness — PR review (close-the-loop reviewer)
 
-You are reviewing one pull request for merge into `main`. The call is JSON-Schema-constrained:
-return a verdict `{recommendation, summary, blocking}` and nothing else.
+You are reviewing one pull request for merge into `main`. It is an **aggregated wave PR** — the
+harness bundled several completed issues' branches into one PR — so review the whole diff as a unit.
+The call is JSON-Schema-constrained: return a verdict `{recommendation, summary, blocking}` and
+nothing else.
 
 - `recommendation` is `"approve"` ONLY if you would merge this PR as-is right now. Otherwise
   `"request_changes"`.
@@ -12,9 +14,9 @@ return a verdict `{recommendation, summary, blocking}` and nothing else.
 
 Judge the diff on:
 
-1. **Correctness.** Does it do what its linked issue asked, without obvious bugs? Logic errors,
-   wrong edge cases, broken control flow, or resource/None handling all block.
-2. **Scope & safety.** Is the change focused on the issue, with no risky out-of-scope edits
+1. **Correctness.** Do the bundled changes do what their issues asked, without obvious bugs? Logic
+   errors, wrong edge cases, broken control flow, or resource/None handling all block.
+2. **Scope & safety.** Is each change focused on its issue, with no risky out-of-scope edits
    (touching the autonomy taxonomy, the action guard, secrets handling, or the merge path itself
    deserves extra scrutiny)? Hexagonal integrity: the engine depends only on ports, wiring stays in
    the composition root.

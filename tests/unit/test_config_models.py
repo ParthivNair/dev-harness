@@ -7,7 +7,11 @@ from pydantic import ValidationError
 
 from harness.adapters.registry.file_registry import FileProjectRegistry
 from harness.application.ownership import owns
-from harness.config.loader import load_harness_config
+from harness.config.loader import (
+    load_harness_config,
+    load_project_config,
+    resolve_project_config_path,
+)
 from harness.config.models import AutonomyTier, HarnessConfig, ProjectConfig
 
 
@@ -18,6 +22,29 @@ def test_repo_harness_config_loads(repo_root: Path) -> None:
     assert cfg.autonomy["force_push"] is AutonomyTier.FORBIDDEN
     assert cfg.autonomy["open_draft_pr"] is AutonomyTier.AUTONOMOUS
     assert {p.id for p in cfg.projects} >= {"sample", "dev-harness"}
+
+
+def test_b4_instance_defaults_gate_verify_and_mark_ready(repo_root: Path) -> None:
+    # The DAW-safe defaults: both stay gated at the instance level so a human-reviewed
+    # repo opts INTO autonomy rather than out of a gate.
+    cfg = load_harness_config(repo_root / "harness.toml")
+    assert cfg.autonomy["verify_gate"] is AutonomyTier.GATED
+    assert cfg.autonomy["mark_pr_ready"] is AutonomyTier.GATED
+
+
+def test_b4_self_managed_project_overrides_verify_and_mark_ready_autonomous(
+    repo_root: Path,
+) -> None:
+    # The dev-harness project (self-managed) opts both into autonomous via
+    # [overrides.autonomy]; effective_autonomy layers it over the gated instance default.
+    cfg = load_harness_config(repo_root / "harness.toml")
+    pointer = next(p for p in cfg.projects if p.id == "dev-harness")
+    project = load_project_config(resolve_project_config_path(pointer, repo_root))
+    eff = project.effective_autonomy(cfg.autonomy)
+    assert eff["verify_gate"] is AutonomyTier.AUTONOMOUS
+    assert eff["mark_pr_ready"] is AutonomyTier.AUTONOMOUS
+    # Other actions still come from the instance taxonomy (override is additive).
+    assert eff["force_push"] is AutonomyTier.FORBIDDEN
 
 
 def test_sample_project_loads_and_is_owned(repo_root: Path) -> None:

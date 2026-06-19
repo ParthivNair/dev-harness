@@ -31,3 +31,12 @@ class Notifier(Protocol):
         Interactive notifiers may block on input here; non-interactive ones do a
         non-blocking check (e.g. "is the response file present yet?").
         """
+
+    def warn(self, message: str) -> None:
+        """Surface an autonomous-path advisory (no answer expected, never blocks).
+
+        Used by the overseer when a best-effort step is skipped — e.g. a wave PR
+        whose branches all conflicted, or a per-repo drafting error swallowed so the
+        tick survives. An OPTIONAL capability: callers tolerate a notifier without it
+        (``getattr(notifier, "warn", None)``), mirroring ``archive``.
+        """

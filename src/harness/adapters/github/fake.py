@@ -25,6 +25,8 @@ class InMemoryGitHub:
     def __init__(self) -> None:
         self._issues: dict[tuple[str, int], IssueRef] = {}
         self._pulls: dict[tuple[str, int], PullRef] = {}
+        # posted comments, keyed by (repo, issue number), for test assertions
+        self.comments: dict[tuple[str, int], list[str]] = {}
         self._next_issue = 1
         self._next_pull = 1000
         # pr_review state: per-PR review diff, CI rollup, and posted reviews.
@@ -140,6 +142,9 @@ class InMemoryGitHub:
         self._issues[(repo, number)] = updated
         return updated
 
+    def comment_on_issue(self, *, repo: str, number: int, body: str) -> None:
+        self.comments.setdefault((repo, number), []).append(body)
+
     def open_draft_pr(
         self, *, repo: str, head: str, base: str, title: str, body: str
     ) -> PullRef:
@@ -154,6 +159,7 @@ class InMemoryGitHub:
             labels=(),
             url=f"https://github.com/{repo}/pull/{number}",
             head=head,
+            body=body,
         )
         self._pulls[(repo, number)] = pr
         return pr

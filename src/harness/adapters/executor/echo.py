@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from harness.config.models import ProjectConfig
-from harness.ports.executor import ClaudeResult, CommandResult
+from harness.ports.executor import ClaudeResult, CommandResult, WaveAssembly
 
 
 class EchoExecutor:
@@ -29,6 +29,22 @@ class EchoExecutor:
         self, *, project: ProjectConfig, branch: str, commit_message: str
     ) -> CommandResult:
         return CommandResult(0, f"[echo] published {branch}", "", 0.01)
+
+    def assemble_wave_branch(
+        self,
+        *,
+        project: ProjectConfig,
+        wave_branch: str,
+        source_branches: list[str],
+        base: str = "origin/main",
+    ) -> WaveAssembly:
+        # No git: pretend every source branch cherry-picked cleanly.
+        return WaveAssembly(
+            branch=wave_branch,
+            head_sha="echo-sha",
+            included=list(source_branches),
+            skipped=[],
+        )
 
     def run_claude_task(
         self,

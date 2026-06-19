@@ -1,10 +1,11 @@
 """End-to-end pr_review loop tests, driven entirely by in-memory fakes.
 
-Proves the close-the-loop reviewer: select a harness-authored PR -> gate on
-mergeable + green CI -> structured review -> merge (per the merge_to_main tier),
-plus the fail-safe paths (CI pending defers, CI failure / unmergeable / changes
-requested never merge), instance-scoped selection, and merge idempotency under the
-runner's at-least-once execution contract.
+Proves the close-the-loop reviewer over the WAVE model: select the overseer's
+aggregated wave PR (``harness/<instance>/wave-<id>``) -> gate on mergeable + green
+CI -> structured review -> merge (per the merge_to_main tier) -> flip every
+aggregated issue PR_OPEN->DONE. Plus the fail-safe paths (CI pending defers, CI
+failure / unmergeable / changes requested never merge), instance-scoped selection,
+and merge idempotency under the runner's at-least-once execution contract.
 """
 
 from __future__ import annotations
@@ -61,27 +62,42 @@ class ReviewExecutor(EchoExecutor):
         )
 
 
-def _seed_pr(
+def _seed_wave_pr(
     gh: InMemoryGitHub,
     *,
+    issue_count: int = 2,
     instance: str = INSTANCE,
     mergeable: Optional[bool] = True,
     checks: ChecksState = ChecksState.SUCCESS,
     changes_requested: bool = False,
     head: Optional[str] = None,
-) -> tuple[int, int]:
-    """Create a linked issue + an open draft PR on a harness branch. Returns (pr, issue)."""
-    issue = gh.create_issue(
-        repo=REPO, title="Add feature", body="do X",
-        labels=[co.IN_PROGRESS, co.owner_label(instance)],
-    )
-    head = head or f"harness/{instance}/issue-{issue.number}"
-    pr = gh.open_draft_pr(repo=REPO, head=head, base="main", title="Add feature", body=f"Resolves #{issue.number}")
+    skip_last: bool = False,
+) -> tuple[int, list[int]]:
+    """Create N issues at PR_OPEN (as dev_task.publish leaves them) and one aggregated
+    wave PR whose body lists them in the overseer's ``- [x] #N`` format. Returns
+    (pr_number, included_issue_numbers)."""
+    issues = [
+        gh.create_issue(
+            repo=REPO, title=f"feature {i}", body="x",
+            labels=[co.PR_OPEN, co.owner_label(instance)],
+        ).number
+        for i in range(issue_count)
+    ]
+    rows = []
+    included: list[int] = []
+    for idx, n in enumerate(issues):
+        checked = not (skip_last and idx == len(issues) - 1)
+        rows.append(f"- [{'x' if checked else ' '}] #{n} — feature (`harness/{instance}/issue-{n}`)")
+        if checked:
+            included.append(n)
+    body = "Aggregated wave PR — one commit per completed issue.\n\n" + "\n".join(rows)
+    head = head or f"harness/{instance}/wave-deadbeef"
+    pr = gh.open_draft_pr(repo=REPO, head=head, base="main", title="harness wave", body=body)
     gh.set_pull(repo=REPO, number=pr.number, mergeable=mergeable)
     gh.set_pull_checks(repo=REPO, number=pr.number, state=checks)
     if changes_requested:
         gh.add_labels(repo=REPO, number=pr.number, labels=[co.CHANGES_REQUESTED])
-    return pr.number, issue.number
+    return pr.number, included
 
 
 def _runner(gh: InMemoryGitHub, *, taxonomy: dict, executor, tmp_path: Path, instance: str = INSTANCE):
@@ -118,9 +134,9 @@ def test_no_reviewable_pr_is_clean_noop(tmp_path: Path) -> None:
     assert store.load(run_id).step_log["select_pr#1"].output["no_pr"] is True
 
 
-def test_autonomous_approve_marks_ready_merges_and_marks_issue_done(tmp_path: Path) -> None:
+def test_autonomous_approve_merges_wave_and_marks_all_issues_done(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, issue_no = _seed_pr(gh)
+    pr_no, issues = _seed_wave_pr(gh, issue_count=3)
     exe = ReviewExecutor(APPROVE)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=exe, tmp_path=tmp_path)
 
@@ -129,16 +145,30 @@ def test_autonomous_approve_marks_ready_merges_and_marks_issue_done(tmp_path: Pa
     pull = gh.get_pull(repo=REPO, number=pr_no)
     assert pull.state is PRState.MERGED and pull.draft is False
     assert gh.merge_method_for(repo=REPO, number=pr_no) == "squash"
-    # an APPROVE review was posted; the linked issue flipped to done.
-    events = [e for e, _ in gh.reviews_for(repo=REPO, number=pr_no)]
-    assert events == [ReviewEvent.APPROVE]
-    assert co.state_of(gh.get_issue(repo=REPO, number=issue_no)) == co.DONE
-    assert co.CHANGES_REQUESTED not in gh.get_pull(repo=REPO, number=pr_no).labels
+    assert [e for e, _ in gh.reviews_for(repo=REPO, number=pr_no)] == [ReviewEvent.APPROVE]
+    # every aggregated issue flipped PR_OPEN -> DONE
+    for n in issues:
+        assert co.state_of(gh.get_issue(repo=REPO, number=n)) == co.DONE
+    assert co.CHANGES_REQUESTED not in pull.labels
+
+
+def test_skipped_issue_in_wave_body_is_not_marked_done(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    pr_no, included = _seed_wave_pr(gh, issue_count=2, skip_last=True)  # last body row is "[ ]"
+    all_issues = {i.number for i in gh.list_issues(repo=REPO, state="open")}
+    skipped = (all_issues - set(included)).pop()
+    store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
+
+    assert runner.run(_create(runner)) is RunStatus.COMPLETED
+    assert gh.get_pull(repo=REPO, number=pr_no).state is PRState.MERGED
+    # only the checked issue is DONE; the conflict-skipped one stays PR_OPEN
+    assert co.state_of(gh.get_issue(repo=REPO, number=included[0])) == co.DONE
+    assert co.state_of(gh.get_issue(repo=REPO, number=skipped)) == co.PR_OPEN
 
 
 def test_request_changes_posts_review_labels_and_does_not_merge(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, issue_no = _seed_pr(gh)
+    pr_no, issues = _seed_wave_pr(gh)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=ReviewExecutor(REJECT), tmp_path=tmp_path)
 
     assert runner.run(_create(runner)) is RunStatus.COMPLETED
@@ -147,19 +177,19 @@ def test_request_changes_posts_review_labels_and_does_not_merge(tmp_path: Path) 
     assert pull.state is PRState.OPEN  # never merged
     assert [e for e, _ in gh.reviews_for(repo=REPO, number=pr_no)] == [ReviewEvent.REQUEST_CHANGES]
     assert co.CHANGES_REQUESTED in pull.labels
-    assert co.state_of(gh.get_issue(repo=REPO, number=issue_no)) != co.DONE
+    for n in issues:
+        assert co.state_of(gh.get_issue(repo=REPO, number=n)) == co.PR_OPEN  # unchanged
 
 
 def test_ci_pending_defers_without_reviewing_or_spending(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, _ = _seed_pr(gh, checks=ChecksState.PENDING)
+    pr_no, _ = _seed_wave_pr(gh, checks=ChecksState.PENDING)
     exe = ReviewExecutor(APPROVE)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=exe, tmp_path=tmp_path)
 
     run_id = _create(runner)
     assert runner.run(run_id) is RunStatus.COMPLETED
-    # No review posted, no Claude spend, no sticky label -> retried cheaply next tick.
-    assert exe.calls == 0
+    assert exe.calls == 0  # no review posted, no Claude spend
     assert gh.reviews_for(repo=REPO, number=pr_no) == []
     assert co.CHANGES_REQUESTED not in gh.get_pull(repo=REPO, number=pr_no).labels
     assert gh.get_pull(repo=REPO, number=pr_no).state is PRState.OPEN
@@ -172,7 +202,7 @@ def test_ci_pending_defers_without_reviewing_or_spending(tmp_path: Path) -> None
 )
 def test_failing_ci_or_unmergeable_labels_and_skips(tmp_path: Path, mergeable: bool, checks: ChecksState) -> None:
     gh = InMemoryGitHub()
-    pr_no, _ = _seed_pr(gh, mergeable=mergeable, checks=checks)
+    pr_no, _ = _seed_wave_pr(gh, mergeable=mergeable, checks=checks)
     exe = ReviewExecutor(APPROVE)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=exe, tmp_path=tmp_path)
 
@@ -185,7 +215,7 @@ def test_failing_ci_or_unmergeable_labels_and_skips(tmp_path: Path, mergeable: b
 
 def test_gated_merge_waits_then_approve_merges(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, issue_no = _seed_pr(gh)
+    pr_no, issues = _seed_wave_pr(gh)
     store, runner = _runner(gh, taxonomy=GATED, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
 
     run_id = _create(runner)
@@ -197,12 +227,13 @@ def test_gated_merge_waits_then_approve_merges(tmp_path: Path) -> None:
     store2, runner2 = _runner(gh, taxonomy=GATED, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
     assert runner2.resume(run_id, _answer(store2, run_id, approved=True)) is RunStatus.COMPLETED
     assert gh.get_pull(repo=REPO, number=pr_no).state is PRState.MERGED
-    assert co.state_of(gh.get_issue(repo=REPO, number=issue_no)) == co.DONE
+    for n in issues:
+        assert co.state_of(gh.get_issue(repo=REPO, number=n)) == co.DONE
 
 
 def test_gated_merge_reject_leaves_pr_open(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, _ = _seed_pr(gh)
+    pr_no, _ = _seed_wave_pr(gh)
     store, runner = _runner(gh, taxonomy=GATED, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
     run_id = _create(runner)
     assert runner.run(run_id) is RunStatus.WAITING
@@ -213,7 +244,7 @@ def test_gated_merge_reject_leaves_pr_open(tmp_path: Path) -> None:
 
 def test_forbidden_tier_reviews_but_never_merges(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, _ = _seed_pr(gh)
+    pr_no, _ = _seed_wave_pr(gh)
     store, runner = _runner(gh, taxonomy=FORBIDDEN, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
 
     assert runner.run(_create(runner)) is RunStatus.COMPLETED
@@ -224,7 +255,7 @@ def test_forbidden_tier_reviews_but_never_merges(tmp_path: Path) -> None:
 
 def test_already_merged_pr_is_noop(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    pr_no, _ = _seed_pr(gh)
+    pr_no, _ = _seed_wave_pr(gh)
     gh.set_pull(repo=REPO, number=pr_no, state=PRState.MERGED)
     exe = ReviewExecutor(APPROVE)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=exe, tmp_path=tmp_path)
@@ -239,7 +270,7 @@ def test_merge_step_is_idempotent_on_at_least_once_reentry(tmp_path: Path) -> No
     """Crash after merge, before the advance-save: the runner re-enters `merge`. It must
     see the PR already MERGED and finish without a second merge."""
     gh = InMemoryGitHub()
-    pr_no, _ = _seed_pr(gh)
+    pr_no, _ = _seed_wave_pr(gh)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
     run_id = _create(runner)
     assert runner.run(run_id) is RunStatus.COMPLETED
@@ -254,10 +285,12 @@ def test_merge_step_is_idempotent_on_at_least_once_reentry(tmp_path: Path) -> No
     assert store.load(run_id).step_log["merge#1"].output["idempotent"] is True
 
 
-def test_other_instance_and_nonharness_branches_not_autoselected(tmp_path: Path) -> None:
+def test_other_instance_and_nonwave_branches_not_autoselected(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    _seed_pr(gh, instance="other-machine")               # another machine's harness PR
-    _seed_pr(gh, head="feature/hand-rolled")             # a human's branch
+    _seed_wave_pr(gh, instance="other-machine")          # another machine's wave PR
+    # a human PR and a bare per-issue branch (not a wave) — neither is ours to merge
+    gh.open_draft_pr(repo=REPO, head="feature/hand-rolled", base="main", title="x", body="")
+    gh.open_draft_pr(repo=REPO, head=f"harness/{INSTANCE}/issue-9", base="main", title="y", body="")
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
 
     run_id = _create(runner)
@@ -267,7 +300,7 @@ def test_other_instance_and_nonharness_branches_not_autoselected(tmp_path: Path)
 
 def test_changes_requested_pr_excluded_from_autoselect(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
-    _seed_pr(gh, changes_requested=True)
+    _seed_wave_pr(gh, changes_requested=True)
     store, runner = _runner(gh, taxonomy=AUTONOMOUS, executor=ReviewExecutor(APPROVE), tmp_path=tmp_path)
     run_id = _create(runner)
     assert runner.run(run_id) is RunStatus.COMPLETED

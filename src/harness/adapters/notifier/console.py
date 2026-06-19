@@ -19,6 +19,9 @@ from harness.domain.models import VerificationRequest, VerificationResponse
 class ConsoleNotifier:
     interactive = True
 
+    def warn(self, message: str) -> None:
+        print(f"  [overseer] {message}")
+
     def notify(self, request: VerificationRequest) -> None:
         print("\n" + "=" * 70)
         print("  VERIFICATION GATE - your perception is required")

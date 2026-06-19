@@ -1,9 +1,11 @@
 """End-to-end dev_task loop tests, driven entirely by in-memory fakes.
 
 Proves the real loop: claim a queued issue -> generate -> build -> test ->
-human gate -> draft PR, plus loop-back on failure and the max-iterations abort
-(which leaves the issue ``harness:blocked``). Resumes go through FRESH store +
-runner instances, as a separate process/machine would.
+human gate -> publish branch, plus loop-back on failure and the max-iterations
+abort (which leaves the issue ``harness:blocked``). The loop opens NO PR of its
+own (B1) — a COMPLETED run means "branch published"; the overseer aggregates the
+published branches into one wave PR. Resumes go through FRESH store + runner
+instances, as a separate process/machine would.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from harness.application import coordination as co
 from harness.application.action_guard import ActionGuard
 from harness.application.loop_runner import LoopRunner
 from harness.config.models import AutonomyTier, ProjectConfig
-from harness.domain.models import BreakerState, RunStatus, VerificationResponse
+from harness.domain.models import BreakerState, RunRecord, RunStatus, VerificationResponse
 from harness.loops.dev_task import build_dev_loop
 from harness.ports.executor import CommandResult
 from tests.fakes import RecordingNotifier
@@ -57,16 +59,17 @@ def _seed_queued_issue(gh: InMemoryGitHub, *, title: str = "Add feature", body: 
     return gh.create_issue(repo=REPO, title=title, body=body, labels=[co.QUEUED]).number
 
 
-def _runner(root: Path, gh: InMemoryGitHub, notifier, executor=None, *, tmp: Path):
+def _runner(root: Path, gh: InMemoryGitHub, notifier, executor=None, *, tmp: Path, taxonomy=None):
     store = AtomicJsonRunStore(root)
     loop = build_dev_loop(
         executor=executor or EchoExecutor(),
         github=gh,
-        guard=ActionGuard(TAXONOMY),
+        guard=ActionGuard(taxonomy if taxonomy is not None else TAXONOMY),
         project=PROJECT,
         instance_id=INSTANCE,
         project_root=tmp,
         artifacts_dir=store.root / "artifacts",
+        store=store,
     )
     return store, LoopRunner(loop, store, notifier)
 
@@ -80,7 +83,7 @@ def _answer(store: AtomicJsonRunStore, run_id: str, *, approved: bool, notes: st
     )
 
 
-def test_happy_path_claims_builds_gates_then_opens_draft_pr(tmp_path: Path) -> None:
+def test_happy_path_claims_builds_gates_then_publishes_no_pr(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
     number = _seed_queued_issue(gh)
     notifier = RecordingNotifier()
@@ -92,7 +95,7 @@ def test_happy_path_claims_builds_gates_then_opens_draft_pr(tmp_path: Path) -> N
         data={"issue_number": number, "repo": REPO},
     ).run_id
 
-    # Runs claim -> generate -> build -> test, then suspends at the gate.
+    # Runs claim -> generate -> build -> test, then suspends at the (gated) verify gate.
     assert runner.run(run_id) is RunStatus.WAITING
     issue = gh.get_issue(repo=REPO, number=number)
     assert co.owner_of(issue) == INSTANCE
@@ -101,17 +104,19 @@ def test_happy_path_claims_builds_gates_then_opens_draft_pr(tmp_path: Path) -> N
     assert rec.current_step == "verify_gate"
     assert rec.data["artifact_path"]  # a perceptual artifact was written
 
-    # Approve through a fresh runner -> opens a DRAFT pr and finishes.
+    # Approve through a fresh runner -> publishes the branch and finishes. The loop
+    # opens NO PR (B1): the overseer aggregates the published branch into a wave PR.
     store2, runner2 = _runner(root, gh, notifier, tmp=tmp_path)
     assert runner2.resume(run_id, _answer(store2, run_id, approved=True, notes="looks good")) is RunStatus.COMPLETED
 
     final = store2.load(run_id)
     assert final.status is RunStatus.COMPLETED
-    assert final.data["pr_url"]
-    assert "publish#1" in final.step_log  # the branch was published before the PR
-    pulls = gh.list_pulls(repo=REPO)
-    assert len(pulls) == 1 and pulls[0].draft is True  # never a ready PR
-    assert co.state_of(gh.get_issue(repo=REPO, number=number)) == co.PR_OPEN
+    assert final.data.get("published") is True       # branch published = the work product
+    assert final.data.get("pr_url") is None          # no per-issue PR opened by the loop
+    assert "publish#1" in final.step_log             # the branch was published
+    assert "open_pr#1" not in final.step_log         # the open_pr step is gone
+    assert gh.list_pulls(repo=REPO) == []            # the loop opened no PR
+    assert co.state_of(gh.get_issue(repo=REPO, number=number)) == co.PR_OPEN  # "published"
 
 
 def test_reject_loops_back_then_approve_completes(tmp_path: Path) -> None:
@@ -132,9 +137,58 @@ def test_reject_loops_back_then_approve_completes(tmp_path: Path) -> None:
     # the rejection notes are carried into the next attempt as failure context
     assert mid.data["last_failure"]["phase"] == "verify"
 
-    # Approve the second gate -> draft PR, completes.
+    # Approve the second gate -> publishes the branch, completes (no per-issue PR).
     assert runner.resume(run_id, _answer(store, run_id, approved=True)) is RunStatus.COMPLETED
-    assert len(gh.list_pulls(repo=REPO)) == 1
+    assert gh.list_pulls(repo=REPO) == []
+    assert store.load(run_id).data.get("published") is True
+
+
+# --------------------------------------------------------------------------- #
+# B2: verify_gate via the autonomy tier.
+# --------------------------------------------------------------------------- #
+def test_b2_autonomous_verify_gate_flows_to_publish_without_a_gate(tmp_path: Path) -> None:
+    # A project that marks verify_gate autonomous (review-at-PR-only) skips the human
+    # gate and runs straight through to publish — and STILL writes the perceptual
+    # artifact + test output in `test`, so the record stays complete.
+    gh = InMemoryGitHub()
+    number = _seed_queued_issue(gh)
+    root = tmp_path / "state"
+    taxonomy = {**TAXONOMY, "verify_gate": AutonomyTier.AUTONOMOUS}
+    store, runner = _runner(root, gh, RecordingNotifier(), tmp=tmp_path, taxonomy=taxonomy)
+    run_id = runner.create_run(
+        project_id="sample", breakers=BreakerState(max_iterations=5),
+        data={"issue_number": number, "repo": REPO},
+    ).run_id
+
+    # No gate: the run completes in a single pass (never WAITING).
+    assert runner.run(run_id) is RunStatus.COMPLETED
+    final = store.load(run_id)
+    assert final.data.get("published") is True
+    assert final.data["artifact_path"]               # the artifact was still written
+    assert final.data["test_stdout"]                 # and the test output recorded
+    assert "verify_gate#1" in final.step_log
+    assert final.step_log["verify_gate#1"].output.get("auto_verified") is True
+    # The issue was never parked in needs-verification — it went straight to published.
+    assert co.state_of(gh.get_issue(repo=REPO, number=number)) == co.PR_OPEN
+    assert gh.list_pulls(repo=REPO) == []            # still no per-issue PR (B1)
+
+
+def test_b2_gated_verify_gate_still_suspends_for_a_human(tmp_path: Path) -> None:
+    # The safe default: verify_gate absent from the taxonomy => GATED => the run still
+    # suspends WAITING at the human gate (the DAW-style review-mid-run path).
+    gh = InMemoryGitHub()
+    number = _seed_queued_issue(gh)
+    root = tmp_path / "state"
+    store, runner = _runner(root, gh, RecordingNotifier(), tmp=tmp_path)  # TAXONOMY: no verify_gate
+    run_id = runner.create_run(
+        project_id="sample", breakers=BreakerState(max_iterations=5),
+        data={"issue_number": number, "repo": REPO},
+    ).run_id
+
+    assert runner.run(run_id) is RunStatus.WAITING
+    rec = store.load(run_id)
+    assert rec.current_step == "verify_gate"
+    assert co.state_of(gh.get_issue(repo=REPO, number=number)) == co.NEEDS_VERIFICATION
 
 
 def test_failing_test_loops_back_with_failure_context(tmp_path: Path) -> None:
@@ -189,3 +243,72 @@ def test_claim_lost_finishes_as_noop_without_spending(tmp_path: Path) -> None:
     assert final.data.get("claim_lost") is None  # output, not data
     assert final.breakers.cumulative_cost_usd == 0.0  # never called claude
     assert final.step_log["claim_issue#1"].output["claim_lost"] is True
+
+
+class PromptCapturingExecutor(EchoExecutor):
+    """Records the prompt fed to ``run_claude_task`` so the handoff-context
+    injection (prior-attempt block) can be asserted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[str] = []
+
+    def run_claude_task(self, *, project, prompt, json_schema=None):  # type: ignore[no-untyped-def]
+        self.prompts.append(prompt)
+        return super().run_claude_task(project=project, prompt=prompt, json_schema=json_schema)
+
+
+def test_generate_injects_prior_attempt_context_when_a_prior_terminal_run_exists(
+    tmp_path: Path,
+) -> None:
+    gh = InMemoryGitHub()
+    number = _seed_queued_issue(gh)
+    root = tmp_path / "state"
+    executor = PromptCapturingExecutor()
+    store, runner = _runner(root, gh, RecordingNotifier(), executor, tmp=tmp_path)
+
+    # A prior TERMINAL dev_task run for this same issue, recorded in the store —
+    # what a handed-off attempt leaves behind for the fresh run to continue.
+    store.create(RunRecord(
+        loop_name="dev_task",
+        project_id="sample",
+        status=RunStatus.ABORTED,
+        terminal_reason="max_iterations (2) exceeded",
+        data={
+            "repo": REPO, "issue_number": number,
+            "branch": "harness/this-machine/issue-prior",
+            "claude_result": "got partway: wrote the parser",
+        },
+        created_at="2026-01-01T00:00:00+00:00",
+    ))
+
+    run_id = runner.create_run(
+        project_id="sample", breakers=BreakerState(max_iterations=5),
+        data={"issue_number": number, "repo": REPO},
+    ).run_id
+    runner.run(run_id)
+
+    assert executor.prompts, "generate should have called the executor"
+    prompt = executor.prompts[0]
+    assert "## Prior attempt(s)" in prompt        # the handoff block was injected
+    assert "ABORTED" in prompt
+    assert "got partway: wrote the parser" in prompt  # last attempt's work carried in
+    assert "do not restart from scratch" in prompt.lower()
+
+
+def test_generate_omits_prior_attempt_context_on_a_first_attempt(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    number = _seed_queued_issue(gh)
+    root = tmp_path / "state"
+    executor = PromptCapturingExecutor()
+    store, runner = _runner(root, gh, RecordingNotifier(), executor, tmp=tmp_path)
+    run_id = runner.create_run(
+        project_id="sample", breakers=BreakerState(max_iterations=5),
+        data={"issue_number": number, "repo": REPO},
+    ).run_id
+    runner.run(run_id)
+
+    # No prior terminal run for this issue -> no handoff block (the live run itself
+    # is RUNNING, not terminal, so it is not counted as a prior attempt).
+    assert executor.prompts
+    assert "## Prior attempt(s)" not in executor.prompts[0]

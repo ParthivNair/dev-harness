@@ -2,13 +2,14 @@
 
     select_pr -> ready_check -> review -> merge   (any step may early-exit, done)
 
-It picks an open PR the harness authored (``harness/<instance>/issue-N``), gates on
-**mergeable + green CI** *before* spending on a review, asks Claude for a structured
+It picks the **overseer's aggregated wave PR** (``harness/<instance>/wave-<id>``), gates
+on **mergeable + green CI** *before* spending on a review, asks Claude for a structured
 verdict over the diff, posts that review, and — **per-repo policy** — merges it to
-``main``. The merge authority is the autonomy action ``merge_to_main``: ``forbidden``
-in the instance default (so non-opted repos keep the draft-PR + human-merge ceiling),
-raised to ``gated`` (review -> human gate -> merge) or ``autonomous`` (review -> merge)
-in a repo's own ``harness.project.toml``.
+``main``, flipping every aggregated issue PR_OPEN -> DONE. It is the "reviewing agent"
+the overseer drafts a wave PR for. The merge authority is the autonomy action
+``merge_to_main``: ``forbidden`` in the instance default (so non-opted repos keep the
+draft-PR + human-merge ceiling), raised to ``gated`` (review -> human gate -> merge) or
+``autonomous`` (review -> merge) in a repo's own ``harness.project.toml``.
 
 Design contract (resolves the adversarial-review blockers):
 
@@ -31,8 +32,8 @@ Design contract (resolves the adversarial-review blockers):
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Optional
 
 from harness.application import coordination as co
 from harness.application.action_guard import (
@@ -140,6 +141,17 @@ def _format_review_body(summary: str, blocking: list, approved: bool) -> str:
     return "\n".join(parts)
 
 
+# The overseer's wave-PR body lists one row per aggregated issue:
+#   "- [x] #123 — title (`branch`)"   (included)   /   "- [ ] #124 …" (skipped on conflict)
+# We mark DONE only the CHECKED rows — the issues whose changes are actually in the PR.
+_WAVE_ISSUE_RE = re.compile(r"^\s*-\s*\[x\]\s*#(\d+)", re.IGNORECASE | re.MULTILINE)
+
+
+def _merged_issue_numbers(pr_body: str) -> list[int]:
+    """Issue numbers aggregated into a merged wave PR (the checked body rows)."""
+    return [int(n) for n in _WAVE_ISSUE_RE.findall(pr_body or "")]
+
+
 def build_pr_review_loop(
     *,
     executor: Executor,
@@ -154,11 +166,6 @@ def build_pr_review_loop(
     base_prompt = _read_prompt(project_root, project)
     repo = project.repo
 
-    def _issue_of(head: Optional[str]) -> Optional[int]:
-        # Instance-scoped: only THIS instance's harness PRs match, so two machines
-        # never race on the same PR and a human's PR is never auto-selected.
-        return co.harness_branch_issue(head, instance_id)
-
     def select_pr(ctx: RunContext) -> StepOutcome:
         explicit = ctx.data.get("pr_number")
         if explicit is not None:
@@ -167,25 +174,19 @@ def build_pr_review_loop(
             pr = github.get_pull(repo=repo, number=int(explicit))
             return StepOutcome(
                 next_step="ready_check",
-                state_patch={"pr_number": pr.number, "issue_number": _issue_of(pr.head), "head": pr.head},
+                state_patch={"pr_number": pr.number, "head": pr.head},
                 output={"pr_number": pr.number, "explicit": True},
             )
-        # Auto-select: lowest open harness/<instance>/issue-N PR not already flagged.
-        candidates: list[tuple[int, Optional[int]]] = []
-        for pr in github.list_pulls(repo=repo, state="open"):
-            issue = _issue_of(pr.head)
-            if issue is None:
-                continue
-            if co.CHANGES_REQUESTED in pr.labels:
-                continue
-            candidates.append((pr.number, issue))
-        if not candidates:
+        # Auto-select: the overseer's lowest open WAVE PR for THIS instance
+        # (harness/<instance>/wave-<id>), not already flagged changes-requested.
+        # Instance-scoped, so two machines never race and a human's PR is never picked.
+        pr_number = co.find_reviewable_pr(github, repo=repo, instance_id=instance_id)
+        if pr_number is None:
             return StepOutcome(next_step=None, output={"no_pr": True})
-        pr_number, issue_number = min(candidates)
         return StepOutcome(
             next_step="ready_check",
-            state_patch={"pr_number": pr_number, "issue_number": issue_number},
-            output={"pr_number": pr_number, "issue_number": issue_number},
+            state_patch={"pr_number": pr_number},
+            output={"pr_number": pr_number},
         )
 
     def ready_check(ctx: RunContext) -> StepOutcome:
@@ -312,22 +313,25 @@ def build_pr_review_loop(
 
         merged = github.merge_pull(repo=repo, number=pr_number, method=project.scheduling.pr_merge_method)
 
-        # Best-effort: flip the linked issue to done (it stays owned by us, so it is not
-        # re-claimable). Advisory — a labeling failure never unmerges the PR — but it is
-        # RECORDED in the output (not silently swallowed) so a stuck issue is visible to
-        # the dashboard / `harness show` and a human can fix the label.
-        issue_number = ctx.data.get("issue_number")
-        issue_done: Optional[object] = None
-        if issue_number is not None:
+        # Best-effort: flip each issue aggregated into this wave PR from PR_OPEN to DONE,
+        # so the overseer's reconcile never re-queues already-merged work. The included
+        # issues are the checked rows of the overseer's wave-PR body. Advisory — a
+        # labeling failure never unmerges the PR — but it IS recorded (not silently
+        # swallowed) so a stuck issue is visible to the dashboard / `harness show`.
+        issues = _merged_issue_numbers(pr.body)
+        done: list[int] = []
+        failed: dict[int, str] = {}
+        for number in issues:
             try:
-                co.transition(github, repo=repo, number=int(issue_number), to_state=co.DONE)
-                issue_done = True
+                co.transition(github, repo=repo, number=number, to_state=co.DONE)
+                done.append(number)
             except Exception as exc:  # noqa: BLE001 — advisory; the merge already happened
-                issue_done = f"failed: {exc!r}"
+                failed[number] = repr(exc)
         return StepOutcome(
             next_step=None,
             state_patch={"merged": True, "pr_merged_ref": merged.url},
-            output={"merged": True, "pr_url": merged.url, "issue": issue_number, "issue_done": issue_done},
+            output={"merged": True, "pr_url": merged.url, "issues_done": done,
+                    "issues_failed": failed or None},
         )
 
     return LoopDefinition(

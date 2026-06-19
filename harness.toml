@@ -31,7 +31,8 @@ file_issue = "autonomous"
 set_labels = "autonomous"
 assign_issue = "autonomous"
 review_pr = "autonomous"            # posting a PR review/comment is low-risk
-mark_pr_ready = "gated"              # draft -> ready crosses into human territory
+verify_gate = "gated"               # mid-run human "perceive the result" gate (DAW-safe default)
+mark_pr_ready = "gated"             # draft -> ready crosses into human territory
 dependency_change = "gated"
 schema_change = "gated"
 # merge_to_main stays forbidden in the INSTANCE default — the draft-PR + human-merge

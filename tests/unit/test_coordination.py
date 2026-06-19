@@ -98,6 +98,117 @@ def test_find_claimable_none_when_no_work() -> None:
     assert co.find_claimable(gh, repo=REPO, instance_id="ME") is None
 
 
+def test_handoff_issue_requeues_labels_and_comments() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh, labels=(co.QUEUED, "sev:high"))
+    co.claim(gh, repo=REPO, number=n, instance_id="A")
+    co.handoff_issue(gh, repo=REPO, number=n, note="## Prior attempt(s)\nstrand")
+    issue = gh.get_issue(repo=REPO, number=n)
+    assert co.state_of(issue) == co.QUEUED          # back on the queue for a fresh run
+    assert co.owner_of(issue) is None               # lease dropped so anyone can claim
+    assert co.HANDOFF in issue.labels               # continuation marker stamped
+    assert "sev:high" in issue.labels               # foreign labels preserved
+    assert gh.comments[(REPO, n)] == ["## Prior attempt(s)\nstrand"]  # packet posted
+
+
+def test_handoff_label_survives_a_later_transition() -> None:
+    # HANDOFF is a foreign label (not a state label), so it must ride through the
+    # next claim/transition just like a human tag.
+    gh = InMemoryGitHub()
+    n = _queued(gh)
+    co.handoff_issue(gh, repo=REPO, number=n, note="packet")
+    co.claim(gh, repo=REPO, number=n, instance_id="B")
+    issue = gh.get_issue(repo=REPO, number=n)
+    assert co.state_of(issue) == co.IN_PROGRESS
+    assert co.HANDOFF in issue.labels
+
+
+def test_fake_comment_on_issue_records_per_issue() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh)
+    gh.comment_on_issue(repo=REPO, number=n, body="first")
+    gh.comment_on_issue(repo=REPO, number=n, body="second")
+    assert gh.comments[(REPO, n)] == ["first", "second"]
+
+
+# --------------------------------------------------------------------------- #
+# C1: dependency-aware, severity-ordered claiming (Phase 2 §2a).
+# --------------------------------------------------------------------------- #
+def test_c1_find_claimable_picks_highest_severity_first() -> None:
+    # Severity is the PRIMARY key: a later, higher-sev issue beats an earlier low one.
+    gh = InMemoryGitHub()
+    low = _queued(gh, title="low", labels=(co.QUEUED, "sev:low"))
+    high = _queued(gh, title="high", labels=(co.QUEUED, "sev:high"))
+    med = _queued(gh, title="med", labels=(co.QUEUED, "sev:med"))
+    assert co.find_claimable(gh, repo=REPO, instance_id="ME") == high
+    _ = (low, med)
+
+
+def test_c1_effort_breaks_ties_at_equal_severity_preferring_smaller() -> None:
+    # At equal severity, lower effort (quicker win) wins, regardless of number order.
+    gh = InMemoryGitHub()
+    big = _queued(gh, title="big", labels=(co.QUEUED, "sev:high", "effort:l"))
+    small = _queued(gh, title="small", labels=(co.QUEUED, "sev:high", "effort:s"))
+    assert co.find_claimable(gh, repo=REPO, instance_id="ME") == small
+    _ = big
+
+
+def test_c1_empty_labels_falls_back_to_number_order() -> None:
+    # Regression-safe: no sev/effort labels anywhere => plain lowest-number order,
+    # exactly the old min(number) behavior.
+    gh = InMemoryGitHub()
+    a = _queued(gh, title="a")
+    _b = _queued(gh, title="b")
+    assert co.find_claimable(gh, repo=REPO, instance_id="ME") == a
+
+
+def test_c1_dependency_gate_skips_issue_whose_dep_is_still_open() -> None:
+    # An issue declaring "Depends on #N" is NOT claimable while #N is open, even if it
+    # is higher severity — so the dependency is worked first.
+    gh = InMemoryGitHub()
+    dep = _queued(gh, title="dependency", labels=(co.QUEUED, "sev:low"))
+    blocked = _queued(
+        gh, title="blocked", body=f"Depends on #{dep}", labels=(co.QUEUED, "sev:high")
+    )
+    # Despite higher severity, the blocked issue is gated -> the open dep is picked.
+    assert co.find_claimable(gh, repo=REPO, instance_id="ME") == dep
+    _ = blocked
+
+
+def test_c1_dependency_releases_once_the_dep_closes() -> None:
+    # Once the dependency is no longer open (resolved/merged), the gated issue becomes
+    # claimable. Modeled by closing the dep issue's open state.
+    gh = InMemoryGitHub()
+    dep = _queued(gh, title="dependency", labels=(co.QUEUED, "sev:low"))
+    blocked = _queued(
+        gh, title="blocked", body=f"Depends on #{dep}", labels=(co.QUEUED, "sev:high")
+    )
+    # Close the dependency (it left the open set) -> the gate releases the blocked issue.
+    closed = co.IssueRef(
+        number=dep, title="dependency", state="closed", labels=(), assignee=None,
+        url=f"https://github.com/{REPO}/issues/{dep}", body="",
+    )
+    gh._issues[(REPO, dep)] = closed  # simulate the dep being merged/closed
+    assert co.find_claimable(gh, repo=REPO, instance_id="ME") == blocked
+
+
+def test_c1_returns_none_when_only_dependency_blocked_work_remains() -> None:
+    # The only queued issue depends on an OPEN non-queued issue -> nothing is ready.
+    gh = InMemoryGitHub()
+    other = gh.create_issue(repo=REPO, title="open feature", body="", labels=[]).number
+    _queued(gh, title="blocked", body=f"Sequencing: #{other}")
+    assert co.find_claimable(gh, repo=REPO, instance_id="ME") is None
+
+
+def test_c1_depends_on_parses_multiple_refs_and_sequencing() -> None:
+    gh = InMemoryGitHub()
+    issue = gh.create_issue(
+        repo=REPO, title="t", body="Depends on #3 and #4\nSequencing: #5", labels=[co.QUEUED]
+    )
+    assert co.depends_on(issue) == [3, 4, 5]
+    assert co.depends_on(gh.create_issue(repo=REPO, title="x", body="no refs", labels=[])) == []
+
+
 def test_claim_succeeds_even_if_assignee_write_fails() -> None:
     # instance_id is usually not a real GitHub user, so assign can 403/422. The
     # owner LABEL is the real lease, so a failed assignee must not abort the claim.

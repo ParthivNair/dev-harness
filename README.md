@@ -143,22 +143,24 @@ uv run harness watch --interval 300
 
 - **Label state machine:** `queued → in-progress → needs-verification → pr-open → done` (+ `blocked` on a breaker trip). Claiming is an optimistic lease with a confirm-read tiebreak (`set_labels` is last-writer-wins), so two machines never double-claim.
 - **Attention diversion:** per-project `[scheduling]` (`priority`/`weight`, `min_poll_interval_seconds`) makes the scheduler check a low-effort repo less often and give a high-priority repo more starts. A **global spend ceiling** (per window) halts new starts while in-flight gates still resume.
-- **The autonomy ceiling (now configurable per repo):** the dev loop publishes its work to a `harness/*` feature branch (`Executor.publish_branch` — guarded: no trunks, no force-push) and opens a **draft** PR. By default the merge is still a human's. A repo can **close the loop** with the `pr_review` loop (below) by opting in per-repo. The harness is registered as a managed project of itself (`harness.project.toml`), so it proposes — and, opted in, merges — its own next milestone.
+- **The autonomy ceiling (now configurable per repo):** the dev loop publishes each issue's work to a `harness/*` feature branch (`Executor.publish_branch` — guarded: no trunks, no force-push) and opens **no PR of its own**; the **overseer** aggregates a wave of completed branches into one wave PR and promotes it to ready. By default the merge is still a human's. A repo can **close the loop** with the `pr_review` loop (below) by opting in per-repo. The harness is registered as a managed project of itself (`harness.project.toml`), so it proposes — and, opted in, reviews and merges — its own next milestone.
 
-### `pr_review` — closing the loop (review + merge, per repo)
+### `pr_review` — closing the loop (review + merge the wave PR, per repo)
+
+The full pipeline: **`dev_task`** (per issue → branch) → **overseer** (aggregate the wave onto `harness/<instance>/wave-<id>`, open one PR, promote to ready) → **`pr_review`** (review that wave PR and merge it). `pr_review` is the "reviewing agent" the overseer drafts the wave PR for.
 
 ```bash
-# Review the next open harness-authored PR and (per the repo's merge policy) merge it.
-uv run harness run pr_review dev-harness            # auto-selects; or --pr <N> to target one
+# Review the next open wave PR and (per the repo's merge policy) merge it.
+uv run harness run pr_review dev-harness            # auto-selects the wave PR; or --pr <N>
 ```
 
-The loop runs `select_pr → ready_check → review → merge`: it picks an open PR on **this instance's** `harness/<instance>/issue-N` branch, gates on **mergeable + green CI** *before* spending on a review, asks Claude for a structured verdict over the diff, posts that review, and then merges per the repo's `merge_to_main` tier:
+The loop runs `select_pr → ready_check → review → merge`: it picks **this instance's** open wave PR (`harness/<instance>/wave-<id>`), gates on **mergeable + green CI** *before* spending on a review, asks Claude for a structured verdict over the whole diff, posts that review, then merges per the repo's `merge_to_main` tier and flips every aggregated issue PR_OPEN → DONE:
 
 - **`forbidden`** (instance default): review + comment, never merge — today's ceiling, unchanged.
 - **`gated`**: review → a verification gate → merge on your approval (fail-safe: timeout = no merge).
 - **`autonomous`**: review → merge directly, no human click — the fully closed loop.
 
-A repo opts in via its own `harness.project.toml` (`[overrides.autonomy] merge_to_main = "..."`), so each project sets its own policy. Merging only ever happens when the PR is mergeable, CI is not failing, the AI review approves with no blocking issues, and the action guard admits it. A PR it won't merge is tagged `harness:changes-requested` so it isn't re-reviewed every tick. Set `[scheduling] pr_review_cadence_seconds` to let the scheduler run it unattended.
+A repo opts in via its own `harness.project.toml` (`[overrides.autonomy] merge_to_main = "..."`), so each project sets its own policy. Merging only ever happens when the PR is mergeable, CI is not failing, the AI review approves with no blocking issues, and the action guard admits it. A wave PR it won't merge is tagged `harness:changes-requested` so it isn't re-reviewed every tick. Set `[scheduling] pr_review_cadence_seconds` to let the scheduler run it unattended.
 
 ### Secrets & `.env`
 
