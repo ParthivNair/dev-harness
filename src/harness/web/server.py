@@ -26,6 +26,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.responses import Response
+from starlette.types import Scope
 
 from harness import operations
 from harness.container import Container
@@ -35,6 +37,19 @@ from harness.ports.run_store import RunNotFound
 STATIC_DIR = Path(__file__).parent / "static"
 
 BackgroundRunner = Callable[[Callable[[], Any]], None]
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """Serve the SPA with ``Cache-Control: no-cache`` so the browser revalidates
+    every asset. The files are tiny and local — caching them buys nothing and risks
+    a fresh ``index.html`` running a *stale cached* ``app.js`` (the queued count
+    updates but the deploy queue stays blank and freshness sticks on "connecting").
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 class AnswerBody(BaseModel):
@@ -72,12 +87,21 @@ def create_app(
     background = background_runner or _default_background
     board_cache: dict[str, Any] = {"at": 0.0, "data": None}
 
-    def cached_board() -> dict[str, Any]:
+    def cached_board(force: bool = False) -> dict[str, Any]:
+        """The GitHub snapshot (counts + deployable issues), cached with a short TTL.
+
+        ``force`` re-fetches now — the dashboard's manual refresh, and after any
+        action that changes the queue (a deploy) so the user never reads a stale
+        count right after acting.
+        """
         now = time.monotonic()
-        if board_cache["data"] is None or (now - board_cache["at"]) > board_ttl_seconds:
-            board_cache["data"] = operations.board(container)
+        if force or board_cache["data"] is None or (now - board_cache["at"]) > board_ttl_seconds:
+            board_cache["data"] = operations.github_snapshot(container)
             board_cache["at"] = now
         return board_cache["data"]
+
+    def invalidate_board() -> None:
+        board_cache["data"] = None
 
     def _require_actions() -> None:
         if not allow_actions:
@@ -91,9 +115,9 @@ def create_app(
 
     # ----- reads ---------------------------------------------------------- #
     @app.get("/api/overview")
-    def overview() -> dict[str, Any]:
+    def overview(fresh: bool = False) -> dict[str, Any]:
         data = operations.overview(container)
-        data["board"] = cached_board()
+        data["board"] = cached_board(force=fresh)
         data["config"] = {"allow_actions": allow_actions, "poll_interval_ms": poll_interval_ms}
         return data
 
@@ -149,6 +173,7 @@ def create_app(
                 container, loop_name=body.loop, project_id=body.project, run_id=record.run_id
             )
         )
+        invalidate_board()  # the deployed issue is leaving the queue — refetch next poll
         return {"run_id": record.run_id, "status": record.status.value}
 
     @app.post("/api/runs/{run_id}/answer")
@@ -178,5 +203,5 @@ def create_app(
         return {"accepted": True}
 
     # ----- static SPA (mounted last so /api/* routes win) ------------------ #
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    app.mount("/", _NoCacheStaticFiles(directory=str(STATIC_DIR), html=True), name="static")
     return app

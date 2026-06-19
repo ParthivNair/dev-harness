@@ -118,3 +118,39 @@ def test_board_reports_queue_depth(tmp_path: Path) -> None:
     c = make_container(tmp_path, repo=REPO, github=gh)
     bd = operations.board(c)
     assert bd["projects"][0]["queued"] == 2
+
+
+def test_github_snapshot_lists_deployable_issues(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    queued = _seed(gh, "queued work")
+    plain = gh.create_issue(repo=REPO, title="human bug", body="x", labels=["bug"]).number
+    # An issue already claimed + in-progress by ANOTHER instance is not deployable here.
+    foreign = gh.create_issue(repo=REPO, title="theirs", body="x", labels=[co.QUEUED]).number
+    co.claim(gh, repo=REPO, number=foreign, instance_id="other-machine")
+
+    c = make_container(tmp_path, instance="this-machine", repo=REPO, github=gh)
+    snap = operations.github_snapshot(c)
+    proj = snap["projects"][0]
+
+    assert proj["queued"] == 1 and proj["in_progress"] == 1
+    views = {i["number"]: i for i in proj["issues"]}
+    assert views[queued]["deployable"] is True        # harness:queued, unclaimed
+    assert views[plain]["deployable"] is True          # plain human issue, claimable
+    assert views[foreign]["deployable"] is False       # owned by another instance
+    assert views[foreign]["owner"] == "other-machine"
+    # Deployable work is ordered ahead of in-progress/claimed work.
+    assert proj["issues"][0]["deployable"] is True
+
+
+def test_github_snapshot_isolates_a_failing_repo(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    _seed(gh)
+
+    def boom(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("token missing")
+
+    gh.list_issues = boom  # type: ignore[method-assign]
+    c = make_container(tmp_path, repo=REPO, github=gh)
+    proj = operations.github_snapshot(c)["projects"][0]
+    assert "token missing" in proj["error"]
+    assert "issues" not in proj or proj["issues"] == []  # never a confident empty/zero

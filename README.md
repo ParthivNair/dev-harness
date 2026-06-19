@@ -94,7 +94,7 @@ To run the whole gate interactively in one process instead, use `--notifier cons
 
 ### The observer dashboard (`harness ui`)
 
-A local web cockpit to watch agents work: a **minimized overview** (one compact line per active run — project, current step, iteration, spend, with verification gates highlighted) that **expands** to per-run detail (step timeline, Claude output, build/test logs, breakers). It can answer gates and start/abort runs from the page. Optional — needs the `web` extra.
+A local web cockpit to watch agents work and put them to work. A **deploy queue** lists the open issues it found on GitHub (queued work first) so you can launch a `dev_task` agent on any of them with one click. Active agents show as **summary headlines** (one compact line each — project, issue, current activity, iteration, spend, with verification gates highlighted) that **maximize** to per-run detail (gate prompt with approve/reject + steering notes, step timeline, Claude output, build/test logs, breakers). GitHub-derived numbers carry an explicit live / stale / offline indicator, so a missing token or dropped connection never reads as a confident "0". Optional — needs the `web` extra.
 
 ```bash
 uv sync --extra web

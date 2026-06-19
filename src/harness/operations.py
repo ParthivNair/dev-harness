@@ -217,6 +217,73 @@ def board(c: Container) -> dict[str, Any]:
     return {"projects": projects}
 
 
+# Rank for ordering the queue list: deployable work first, finished/blocked last.
+_STATE_RANK = {
+    co.QUEUED: 0,
+    None: 1,  # plain human-filed issue, no harness label — still deployable
+    co.IN_PROGRESS: 2,
+    co.NEEDS_VERIFICATION: 3,
+    co.PR_OPEN: 4,
+    co.BLOCKED: 5,
+    co.DONE: 6,
+}
+
+
+def _issue_view(issue: Any, instance: str) -> dict[str, Any]:
+    """Compact projection of one open issue for the dashboard's deploy queue."""
+    state = co.state_of(issue)
+    owner = co.owner_of(issue)
+    return {
+        "number": issue.number,
+        "title": issue.title,
+        "url": issue.url,
+        "state": state,  # the harness:<state> label (or None for a plain issue)
+        "owner": owner,  # the instance holding the lease, if any
+        "labels": [
+            label
+            for label in issue.labels
+            if label not in co.STATE_LABELS and not label.startswith(co.OWNER_PREFIX)
+        ],
+        # Deployable = we can claim it: unclaimed (or ours) and not already past queue.
+        "deployable": owner in (None, instance) and state in (None, co.QUEUED),
+    }
+
+
+def github_snapshot(c: Container) -> dict[str, Any]:
+    """One GitHub pass per owned project: the board COUNTS *and* the actual open
+    ISSUES (each flagged ``deployable``), so the dashboard renders real work items
+    with one-click deploys instead of bare totals. Network-bound — the web server
+    caches it with a short TTL so fast polling never hammers the API.
+
+    Supersedes :func:`board` for the dashboard; ``board`` is kept for callers that
+    only need the counts. Computed from a single ``list_issues`` per project.
+    """
+    instance = c.cfg.instance.instance_id
+    projects: list[dict[str, Any]] = []
+    for p in c.registry.list_owned(instance):
+        entry: dict[str, Any] = {"id": p.id, "repo": p.repo}
+        try:
+            issues = c.github.list_issues(repo=p.repo, state="open")
+            states = Counter(co.state_of(i) for i in issues)
+            pulls = c.github.list_pulls(repo=p.repo, state="open")
+            ordered = sorted(
+                issues, key=lambda i: (_STATE_RANK.get(co.state_of(i), 9), i.number)
+            )
+            entry.update(
+                queued=states.get(co.QUEUED, 0),
+                in_progress=states.get(co.IN_PROGRESS, 0),
+                needs_verification=states.get(co.NEEDS_VERIFICATION, 0),
+                pr_open=states.get(co.PR_OPEN, 0),
+                blocked=states.get(co.BLOCKED, 0),
+                open_prs=len(pulls),
+                issues=[_issue_view(i, instance) for i in ordered],
+            )
+        except Exception as exc:  # noqa: BLE001 — a board read must never 500 the page
+            entry["error"] = str(exc)
+        projects.append(entry)
+    return {"projects": projects, "instance": instance}
+
+
 def run_summary(r: RunRecord) -> dict[str, Any]:
     """The compact projection the minimized dashboard view renders per run."""
     return {
@@ -234,6 +301,7 @@ def run_summary(r: RunRecord) -> dict[str, Any]:
         "has_gate": r.pending_request is not None,
         "gate_prompt": r.pending_request.prompt if r.pending_request else None,
         "issue": r.data.get("issue_number"),
+        "issue_title": r.data.get("issue_title"),
         "repo": r.data.get("repo"),
         "branch": r.data.get("branch"),
         "pr_url": r.data.get("pr_url"),

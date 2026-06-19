@@ -29,7 +29,9 @@ async function api(path, opts) {
 
 function fmtAgo(iso) {
   if (!iso) return "";
-  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  return fmtSecs(Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000));
+}
+function fmtSecs(s) {
   if (s < 60) return `${s | 0}s ago`;
   if (s < 3600) return `${(s / 60) | 0}m ago`;
   if (s < 86400) return `${(s / 3600) | 0}h ago`;
@@ -40,32 +42,83 @@ function money(x) { return "$" + (x || 0).toFixed(2); }
 let CONFIG = { allow_actions: true, poll_interval_ms: 1500 };
 let OPEN_RUN = null;
 let POLL_MS = 1500;
+let LOADED = false;        // has a first successful poll landed? (else: show skeleton, not zeros)
+let CONN_OK = false;       // is the most recent poll fresh?
+let LAST_OK = 0;           // epoch ms of the last successful poll
+let pollTimer = null;
+
+// Human-readable activity for the summary headline (vs. raw step ids).
+const STEP_LABELS = {
+  claim_issue: "claiming the issue",
+  generate: "writing the change",
+  build: "building",
+  test: "running tests",
+  verify_gate: "ready for your review",
+  publish: "committing & pushing",
+  open_pr: "opening a draft PR",
+  finish: "wrapping up",
+  synthesize: "synthesizing",
+  render: "rendering",
+};
+function stepLabel(r) {
+  if (r.status === "WAITING" && r.has_gate) return "awaiting your verification";
+  const base = (r.current_step || "").split("#")[0];
+  return STEP_LABELS[base] || r.current_step || (r.status || "").toLowerCase();
+}
 
 // ---- polling ----
-async function poll() {
+async function poll(fresh) {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   try {
-    const data = await api("/api/overview");
+    const data = await api("/api/overview" + (fresh ? "?fresh=1" : ""));
     CONFIG = data.config || CONFIG;
     POLL_MS = CONFIG.poll_interval_ms || 1500;
+    LOADED = true; CONN_OK = true; LAST_OK = Date.now();
     render(data);
-    $("conn").classList.remove("bad");
     if (OPEN_RUN) refreshDrawer(OPEN_RUN);
   } catch (e) {
-    $("conn").classList.add("bad");
+    CONN_OK = false;
     $("conn").title = "disconnected: " + e.message;
   } finally {
-    setTimeout(poll, POLL_MS);
+    updateFreshness();
+    pollTimer = setTimeout(() => poll(false), POLL_MS);
   }
+}
+
+// Freshness ticks once a second so a stalled/dead poll is visibly stale, not silently old.
+function updateFreshness() {
+  const f = $("freshness");
+  const conn = $("conn");
+  const stats = $("stats");
+  if (!LOADED) { f.textContent = "connecting…"; f.className = "fresh muted"; return; }
+  const age = (Date.now() - LAST_OK) / 1000;
+  const stale = !CONN_OK || age > 5;
+  conn.classList.toggle("bad", stale);
+  stats.classList.toggle("stale", stale);
+  if (!CONN_OK) { f.textContent = "offline · last seen " + fmtSecs(age); f.className = "fresh bad"; }
+  else if (stale) { f.textContent = "stale · " + fmtSecs(age); f.className = "fresh warn"; }
+  else { f.textContent = "live"; f.className = "fresh ok"; }
 }
 
 // ---- render overview ----
 function render(d) {
+  $("stats").classList.remove("loading");
   $("instance").textContent = d.instance ? "· " + d.instance : "";
   $("stat-active").textContent = d.totals.active;
   $("stat-gates").textContent = d.totals.waiting;
 
-  const queued = (d.board?.projects || []).reduce((a, p) => a + (p.queued || 0), 0);
-  $("stat-queued").textContent = (d.board?.projects?.length ? queued : "–");
+  const projects = d.board?.projects || [];
+  const okProjects = projects.filter((p) => !p.error);
+  const errProjects = projects.filter((p) => p.error);
+  const boardErr = errProjects.length > 0;
+  const queued = okProjects.reduce((a, p) => a + (p.queued || 0), 0);
+  // Show the queued depth we *do* know (from repos that loaded); only fall back to
+  // "!" when nothing loaded. A partial failure flags via the tooltip + queue banner,
+  // it doesn't blank out a known-good repo's count.
+  $("stat-queued").textContent = projects.length ? (okProjects.length ? queued : "!") : "·";
+  $("stat-queued").title = boardErr
+    ? "GitHub unavailable for: " + errProjects.map((p) => p.repo || p.id).join(", ")
+    : "";
 
   const sp = d.spend || {};
   const pct = sp.ceiling_usd ? Math.min(100, (sp.window_usd / sp.ceiling_usd) * 100) : 0;
@@ -75,34 +128,128 @@ function render(d) {
   $("btn-start").hidden = !CONFIG.allow_actions;
   $("btn-tick").hidden = !CONFIG.allow_actions;
 
-  // active
+  // active ("working now") — summary headlines
+  const active = d.active || [];
   const al = $("active-list"); al.innerHTML = "";
-  (d.active || []).forEach((r) => al.appendChild(runRow(r)));
-  $("active-empty").hidden = (d.active || []).length > 0;
+  active.forEach((r) => al.appendChild(runRow(r)));
+  $("active-empty").hidden = active.length > 0;
+  $("active-count").textContent = active.length ? `(${active.length})` : "";
+
+  // queue — the deployable work
+  renderQueue(projects, boardErr);
 
   // recent
+  const recent = d.recent || [];
   const rl = $("recent-list"); rl.innerHTML = "";
-  (d.recent || []).forEach((r) => rl.appendChild(runRow(r)));
-  $("recent-count").textContent = `(${(d.recent || []).length})`;
+  recent.forEach((r) => rl.appendChild(runRow(r)));
+  $("recent-count").textContent = `(${recent.length})`;
 
-  // board
+  // board (counts summary)
   const bd = $("board"); bd.innerHTML = "";
-  (d.board?.projects || []).forEach((p) => bd.appendChild(boardCard(p)));
+  projects.forEach((p) => bd.appendChild(boardCard(p)));
+  $("board-sub").textContent = projects.length ? `(${projects.length})` : "";
 }
 
 function runRow(r) {
   const isGate = r.status === "WAITING" && r.has_gate;
   const cls = "run" + (isGate ? " gate" : "");
-  const issue = r.issue ? `#${r.issue}` : (r.loop || "");
-  return el("div", { class: cls, onclick: () => openDrawer(r.run_id) },
+  const ref = r.issue ? `#${r.issue}` : (r.loop || "");
+  const title = r.issue_title || "";
+  return el("div", { class: cls, onclick: () => openDrawer(r.run_id), title: "click to expand" },
     el("span", { class: "dot " + r.status }),
-    el("div", { class: "proj" }, `${r.project || "—"} `, el("span", { class: "loop" }, issue)),
-    el("div", { class: "step" }, isGate ? "awaiting your verification" : (r.current_step || r.status.toLowerCase())),
+    el("div", { class: "proj" },
+      `${r.project || "—"} `,
+      el("span", { class: "loop" }, ref),
+      title ? el("span", { class: "ititle" }, " " + title) : null,
+    ),
+    el("div", { class: "step" }, stepLabel(r)),
     el("div", { class: "iter" }, `it ${r.iter}/${r.max_iter}`),
     el("div", { class: "cost" }, `${money(r.cost_usd)}/${money(r.budget_usd)}`),
     el("div", { class: "meta" }, fmtAgo(r.updated_at)),
     isGate ? el("span", { class: "badge" }, "NEEDS YOU") : el("span", {}),
   );
+}
+
+// ---- queue (deploy an agent) ----
+function renderQueue(projects, boardErr) {
+  const q = $("queue"); q.innerHTML = "";
+  const banner = $("queue-banner");
+  const errs = projects.filter((p) => p.error);
+  if (errs.length) {
+    banner.hidden = false;
+    banner.textContent = "⚠ " + errs.map((p) => `${p.repo || p.id}: ${p.error}`).join("  ·  ");
+  } else {
+    banner.hidden = true;
+  }
+
+  let total = 0, deployable = 0;
+  const multi = projects.filter((p) => !p.error).length > 1;
+  projects.forEach((p) => {
+    const list = p.issues || [];
+    if (p.error || !list.length) return;
+    if (multi) q.appendChild(el("div", { class: "qgroup" }, p.repo || p.id));
+    list.forEach((iss) => {
+      total++;
+      if (iss.deployable) deployable++;
+      q.appendChild(issueRow(p.id, iss));
+    });
+  });
+
+  $("queue-empty").hidden = total > 0 || boardErr;
+  $("queue-count").textContent = deployable ? `(${deployable} ready)` : (total ? "" : "");
+}
+
+const STATE_CHIP = {
+  "harness:queued": ["queued", "qd"],
+  "harness:in-progress": ["in progress", "ip"],
+  "harness:needs-verification": ["needs review", "nv"],
+  "harness:pr-open": ["PR open", "pr"],
+  "harness:blocked": ["blocked", "bl"],
+  "harness:done": ["done", "dn"],
+};
+
+function issueRow(projectId, iss) {
+  const chips = [];
+  if (iss.state && STATE_CHIP[iss.state]) {
+    const [lbl, k] = STATE_CHIP[iss.state];
+    chips.push(el("span", { class: "chip state " + k }, lbl));
+  } else if (!iss.state) {
+    chips.push(el("span", { class: "chip ghost" }, "unlabeled"));
+  }
+  (iss.labels || []).slice(0, 3).forEach((l) => chips.push(el("span", { class: "chip ghost" }, l)));
+
+  let action;
+  if (CONFIG.allow_actions && iss.deployable) {
+    action = el("button", { class: "btn deploy",
+      onclick: (e) => { e.stopPropagation(); deployIssue(projectId, iss, e.currentTarget); } },
+      "🚀 deploy agent");
+  } else if (iss.owner) {
+    action = el("span", { class: "qclaimed", title: "claimed by " + iss.owner }, "claimed");
+  } else {
+    action = el("span", {});
+  }
+
+  return el("div", { class: "issue" },
+    el("a", { class: "inum", href: iss.url, target: "_blank", title: "open on GitHub" }, `#${iss.number}`),
+    el("div", { class: "ititle", title: iss.title }, iss.title),
+    el("div", { class: "ichips" }, ...chips),
+    action,
+  );
+}
+
+async function deployIssue(projectId, iss, btn) {
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "deploying…";
+  try {
+    const r = await api("/api/runs", postJson({ loop: "dev_task", project: projectId, issue: iss.number }));
+    await poll(true);        // pull fresh state now (queue + working-now reflect the deploy)
+    openDrawer(r.run_id);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = prev;
+    alert("deploy failed: " + e.message);
+  }
 }
 
 function boardCard(p) {
@@ -119,7 +266,7 @@ function boardCard(p) {
   );
 }
 
-// ---- detail drawer ----
+// ---- detail drawer (maximized run view) ----
 async function openDrawer(runId) {
   OPEN_RUN = runId;
   $("overlay").hidden = false;
@@ -142,7 +289,7 @@ function renderDetail(rec) {
   $("d-title").textContent = `${rec.project_id || "—"} · ${rec.loop_name}`;
   $("d-sub").textContent = `${rec.status} · ${rec.run_id}`;
 
-  // gate box
+  // gate box — the interaction point: approve, or reject with steering notes
   const gb = $("d-gate");
   if (rec.status === "WAITING" && rec.pending_request) {
     gb.hidden = false; gb.innerHTML = "";
@@ -152,7 +299,7 @@ function renderDetail(rec) {
       row.appendChild(el("a", { class: "btn", href: `/api/runs/${rec.run_id}/artifact`, target: "_blank" }, "open artifact"));
     }
     if (CONFIG.allow_actions) {
-      const notes = el("input", { class: "notes", type: "text", placeholder: "notes (optional)" });
+      const notes = el("input", { class: "notes", type: "text", placeholder: "notes — steer the next iteration (optional)" });
       row.appendChild(el("button", { class: "btn ok", onclick: () => answer(rec.run_id, true, notes.value) }, "approve"));
       row.appendChild(el("button", { class: "btn danger", onclick: () => answer(rec.run_id, false, notes.value) }, "reject"));
       row.appendChild(notes);
@@ -238,7 +385,7 @@ function postJson(body) {
   return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
 }
 
-// ---- start dialog ----
+// ---- start dialog (advanced) ----
 function openStart() { $("start-overlay").hidden = false; $("start-dialog").hidden = false; $("start-error").hidden = true; }
 function closeStart() { $("start-overlay").hidden = true; $("start-dialog").hidden = true; }
 async function doStart() {
@@ -251,6 +398,7 @@ async function doStart() {
   try {
     const r = await api("/api/runs", postJson(body));
     closeStart();
+    await poll(true);
     openDrawer(r.run_id);
   } catch (e) { showStartErr(e.message); }
 }
@@ -259,17 +407,22 @@ function showStartErr(m) { const e = $("start-error"); e.textContent = m; e.hidd
 // ---- wire up ----
 $("d-close").addEventListener("click", closeDrawer);
 $("overlay").addEventListener("click", closeDrawer);
+$("btn-refresh").addEventListener("click", () => poll(true));
 $("btn-tick").addEventListener("click", tick);
 $("btn-start").addEventListener("click", openStart);
 $("start-cancel").addEventListener("click", closeStart);
 $("start-overlay").addEventListener("click", closeStart);
 $("start-go").addEventListener("click", doStart);
+$("queue-toggle").addEventListener("click", (e) => {
+  e.currentTarget.classList.toggle("collapsed"); $("queue").hidden = !$("queue").hidden;
+});
 $("recent-toggle").addEventListener("click", (e) => {
-  e.target.classList.toggle("collapsed"); $("recent-list").hidden = !$("recent-list").hidden;
+  e.currentTarget.classList.toggle("collapsed"); $("recent-list").hidden = !$("recent-list").hidden;
 });
 $("board-toggle").addEventListener("click", (e) => {
-  e.target.classList.toggle("collapsed"); $("board").hidden = !$("board").hidden;
+  e.currentTarget.classList.toggle("collapsed"); $("board").hidden = !$("board").hidden;
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrawer(); closeStart(); } });
 
+setInterval(updateFreshness, 1000);
 poll();

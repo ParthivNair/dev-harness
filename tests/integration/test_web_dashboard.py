@@ -52,6 +52,34 @@ def test_overview_endpoint_shape(tmp_path: Path) -> None:
     assert body["board"]["projects"][0]["queued"] == 1
 
 
+def test_overview_board_lists_deployable_issues(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    number = _seed(gh)
+    client = _client(make_container(tmp_path, repo=REPO, github=gh))
+    proj = client.get("/api/overview").json()["board"]["projects"][0]
+    issues = proj["issues"]
+    assert [i["number"] for i in issues] == [number]
+    assert issues[0]["deployable"] is True
+    assert issues[0]["title"] == "Add feature"
+
+
+def test_deploy_specific_issue_then_fresh_refetch(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    number = _seed(gh)
+    client = _client(make_container(tmp_path, repo=REPO, github=gh))
+
+    # Deploy an agent on THIS issue (the one-click queue button posts exactly this).
+    res = client.post("/api/runs", json={"loop": "dev_task", "project": "sample", "issue": number})
+    assert res.status_code == 200, res.text
+
+    # A plain poll may serve the cached snapshot; ?fresh=1 forces a refetch so the
+    # just-deployed issue is no longer offered as deployable.
+    proj = client.get("/api/overview", params={"fresh": "true"}).json()["board"]["projects"][0]
+    view = next(i for i in proj["issues"] if i["number"] == number)
+    assert view["deployable"] is False
+    assert view["state"] == co.NEEDS_VERIFICATION  # echo loop drove it to the gate
+
+
 def test_start_then_run_detail_is_waiting(tmp_path: Path) -> None:
     gh = InMemoryGitHub()
     _seed(gh)

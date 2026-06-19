@@ -13,16 +13,18 @@
       <span class="title">dev-harness</span>
       <span id="instance" class="muted"></span>
     </div>
-    <div id="stats" class="stats">
-      <div class="stat"><span class="num" id="stat-active">0</span><span class="lbl">active</span></div>
-      <div class="stat gate"><span class="num" id="stat-gates">0</span><span class="lbl">gates</span></div>
-      <div class="stat"><span class="num" id="stat-queued">–</span><span class="lbl">queued</span></div>
+    <div id="stats" class="stats loading">
+      <div class="stat"><span class="num" id="stat-active">·</span><span class="lbl">active</span></div>
+      <div class="stat gate"><span class="num" id="stat-gates">·</span><span class="lbl">gates</span></div>
+      <div class="stat"><span class="num" id="stat-queued">·</span><span class="lbl">queued</span></div>
       <div class="stat spend">
         <div class="spendbar"><div id="spend-fill" class="spendfill"></div></div>
-        <span class="lbl" id="spend-label">$0 / $0</span>
+        <span class="lbl" id="spend-label">— / —</span>
       </div>
     </div>
     <div class="actions" id="topactions">
+      <span id="freshness" class="fresh muted">connecting…</span>
+      <button id="btn-refresh" class="btn ghost" title="Refresh from GitHub now">↻</button>
       <button id="btn-start" class="btn" hidden>+ start</button>
       <button id="btn-tick" class="btn" hidden>tick now</button>
       <span id="conn" class="conn" title="connection">●</span>
@@ -30,24 +32,31 @@
   </header>
 
   <main>
-    <section>
-      <h2>Working now</h2>
+    <section id="sec-active">
+      <h2>Working now <span class="muted" id="active-count"></span></h2>
       <div id="active-list" class="runlist"></div>
-      <p id="active-empty" class="empty">No agents working. Start a run, or tick the scheduler.</p>
+      <p id="active-empty" class="empty">No agents working yet — deploy one from the queue below.</p>
+    </section>
+
+    <section id="sec-queue">
+      <h2 class="collapsible" id="queue-toggle">Queue · deploy an agent <span class="muted" id="queue-count"></span></h2>
+      <div id="queue-banner" class="banner" hidden></div>
+      <div id="queue" class="issuelist"></div>
+      <p id="queue-empty" class="empty" hidden>No open issues to deploy.</p>
     </section>
 
     <section>
-      <h2 class="collapsible" id="recent-toggle">Recent <span class="muted" id="recent-count"></span></h2>
-      <div id="recent-list" class="runlist dim"></div>
+      <h2 class="collapsible collapsed" id="recent-toggle">Recent <span class="muted" id="recent-count"></span></h2>
+      <div id="recent-list" class="runlist dim" hidden></div>
     </section>
 
     <section>
-      <h2 class="collapsible" id="board-toggle">Board</h2>
-      <div id="board" class="board"></div>
+      <h2 class="collapsible collapsed" id="board-toggle">Board <span class="muted" id="board-sub"></span></h2>
+      <div id="board" class="board" hidden></div>
     </section>
   </main>
 
-  <!-- Detail drawer -->
+  <!-- Detail drawer (maximized run view) -->
   <div id="overlay" class="overlay" hidden></div>
   <aside id="drawer" class="drawer" hidden>
     <div class="drawer-head">
@@ -55,13 +64,13 @@
         <div id="d-title" class="d-title"></div>
         <div id="d-sub" class="muted small"></div>
       </div>
-      <button id="d-close" class="btn ghost">✕</button>
+      <button id="d-close" class="btn ghost" title="Minimize">▢ minimize</button>
     </div>
     <div id="d-gate" class="gatebox" hidden></div>
     <div id="d-body" class="d-body"></div>
   </aside>
 
-  <!-- Start-run dialog -->
+  <!-- Start-run dialog (advanced) -->
   <div id="start-overlay" class="overlay" hidden></div>
   <div id="start-dialog" class="dialog" hidden>
     <h3>Start a run</h3>
