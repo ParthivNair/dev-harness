@@ -100,6 +100,41 @@ def test_no_queued_work_raises(tmp_path: Path) -> None:
         operations.create_run_for(c, loop="dev_task", project_id="sample")
 
 
+def test_cancel_issue_releases_lease_and_requeues(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    number = gh.create_issue(repo=REPO, title="t", body="x", labels=[co.QUEUED, "bug"]).number
+    co.claim(gh, repo=REPO, number=number, instance_id="this-machine")
+    c = make_container(tmp_path, instance="this-machine", repo=REPO, github=gh)
+
+    ref = operations.cancel_issue(c, project_id="sample", number=number)
+    assert co.state_of(ref) == co.QUEUED
+    assert co.owner_of(ref) is None
+    assert "bug" in ref.labels  # foreign labels survive the release
+    issue = gh.get_issue(repo=REPO, number=number)
+    assert co.state_of(issue) == co.QUEUED and co.owner_of(issue) is None
+
+
+def test_cancel_issue_is_idempotent_on_already_queued(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    number = _seed(gh)  # plain harness:queued, no lease
+    c = make_container(tmp_path, instance="this-machine", repo=REPO, github=gh)
+    # Cancelling unowned/queued work is a safe no-op relabel, not a crash.
+    ref = operations.cancel_issue(c, project_id="sample", number=number)
+    assert co.state_of(ref) == co.QUEUED
+    assert co.owner_of(ref) is None
+
+
+def test_cancel_issue_not_owned_raises(tmp_path: Path) -> None:
+    gh = InMemoryGitHub()
+    number = _seed(gh)
+    co.claim(gh, repo=REPO, number=number, instance_id="other-machine")
+    c = make_container(tmp_path, instance="this-machine", owner="other-machine", repo=REPO, github=gh)
+    with pytest.raises(operations.NotOwned):
+        operations.cancel_issue(c, project_id="sample", number=number)
+    # The lease is untouched: we read, we did not act.
+    assert co.owner_of(gh.get_issue(repo=REPO, number=number)) == "other-machine"
+
+
 def test_overview_aggregates_active_and_spend(tmp_path: Path) -> None:
     c, _gh, run_id, _ = _to_gate(tmp_path)
     ov = operations.overview(c)

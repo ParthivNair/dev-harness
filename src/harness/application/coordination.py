@@ -99,6 +99,26 @@ def release(github: GitHubAdapter, *, repo: str, number: int) -> IssueRef:
     return github.set_labels(repo=repo, number=number, labels=labels)
 
 
+def done(github: GitHubAdapter, *, repo: str, number: int) -> IssueRef:
+    """Close the lifecycle: a human merged the PR, so drop the lease and mark the
+    issue ``done``. Mirrors :func:`release` (lease dropped via ``owner=None``) but
+    lands in the terminal state instead of requeuing.
+
+    ``done`` is reachable only from a merged PR, so a call against any other state
+    is a bug to surface, not silently absorb — refuse unless the issue is currently
+    ``pr-open``.
+    """
+    issue = github.get_issue(repo=repo, number=number)
+    state = state_of(issue)
+    if state != PR_OPEN:
+        raise ValueError(
+            f"issue #{number} is {state or 'unlabeled'}, not {PR_OPEN}; "
+            f"only a pr-open issue can transition to done"
+        )
+    labels = _compute_labels(issue, to_state=DONE, owner=None)
+    return github.set_labels(repo=repo, number=number, labels=labels)
+
+
 def owns_issue(github: GitHubAdapter, *, repo: str, number: int, instance_id: str) -> bool:
     """Does ``instance_id`` currently hold this issue's lease?"""
     return owner_of(github.get_issue(repo=repo, number=number)) == instance_id
@@ -181,3 +201,36 @@ def find_claimable(
     if not candidates:
         return None
     return min(i.number for i in candidates)
+
+
+def reconcile_orphans(
+    github: GitHubAdapter,
+    *,
+    repo: str,
+    instance_id: str,
+    active_run_issue_numbers: set[int],
+) -> list[int]:
+    """Requeue stranded ``in-progress`` issues THIS instance owns but no longer runs.
+
+    Crash recovery: if this instance claimed an issue (``in-progress`` + owner label)
+    then died before finishing, nothing else requeues it — :func:`find_claimable`
+    only scans ``queued``, so the orphan is invisible to every tick forever. On
+    restart this lists open ``IN_PROGRESS`` issues we own and :func:`release`\\ s each
+    one that has no corresponding active/WAITING run back to ``queued``.
+
+    Scoped to OUR own leases (``owner_of == instance_id``) so it never steals another
+    live machine's work — matching the no-central-dispatcher model. Liveness is the
+    active-run set, NOT wall-clock age (``RunRecord`` carries no claimed-at): a lease
+    still backed by a run is left untouched. Foreign labels are preserved exactly as
+    :func:`transition`/:func:`release` do. Idempotent — a second pass finds nothing,
+    the issues are ``queued`` again. Returns the reclaimed issue numbers.
+    """
+    reclaimed: list[int] = []
+    for issue in github.list_issues(repo=repo, state="open", labels=[IN_PROGRESS]):
+        if owner_of(issue) != instance_id:
+            continue
+        if issue.number in active_run_issue_numbers:
+            continue
+        release(github, repo=repo, number=issue.number)
+        reclaimed.append(issue.number)
+    return reclaimed

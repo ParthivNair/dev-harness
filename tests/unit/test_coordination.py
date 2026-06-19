@@ -84,6 +84,52 @@ def test_release_drops_lease_and_requeues() -> None:
     assert "bug" in issue.labels
 
 
+def test_reconcile_requeues_stale_lease_no_active_run() -> None:
+    # We crashed mid-run: the issue is in-progress + owned by us, but no run backs it.
+    gh = InMemoryGitHub()
+    n = _queued(gh, labels=(co.QUEUED, "sev:high", "bug"))
+    co.claim(gh, repo=REPO, number=n, instance_id="win")
+    reclaimed = co.reconcile_orphans(
+        gh, repo=REPO, instance_id="win", active_run_issue_numbers=set()
+    )
+    assert reclaimed == [n]
+    issue = gh.get_issue(repo=REPO, number=n)
+    assert co.state_of(issue) == co.QUEUED         # back to the queue
+    assert co.owner_of(issue) is None              # lease dropped
+    assert "sev:high" in issue.labels and "bug" in issue.labels  # foreign labels kept
+
+
+def test_reconcile_leaves_live_lease_with_active_run_alone() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh)
+    co.claim(gh, repo=REPO, number=n, instance_id="win")
+    reclaimed = co.reconcile_orphans(
+        gh, repo=REPO, instance_id="win", active_run_issue_numbers={n}
+    )
+    assert reclaimed == []
+    assert co.state_of(gh.get_issue(repo=REPO, number=n)) == co.IN_PROGRESS  # untouched
+
+
+def test_reconcile_never_steals_another_instances_lease() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh)
+    co.claim(gh, repo=REPO, number=n, instance_id="other")
+    reclaimed = co.reconcile_orphans(
+        gh, repo=REPO, instance_id="win", active_run_issue_numbers=set()
+    )
+    assert reclaimed == []
+    assert co.owner_of(gh.get_issue(repo=REPO, number=n)) == "other"  # foreign lease intact
+
+
+def test_reconcile_is_idempotent() -> None:
+    gh = InMemoryGitHub()
+    n = _queued(gh)
+    co.claim(gh, repo=REPO, number=n, instance_id="win")
+    assert co.reconcile_orphans(gh, repo=REPO, instance_id="win", active_run_issue_numbers=set()) == [n]
+    # Second pass: the issue is queued again, so there is nothing left to reclaim.
+    assert co.reconcile_orphans(gh, repo=REPO, instance_id="win", active_run_issue_numbers=set()) == []
+
+
 def test_find_claimable_returns_lowest_queued_and_skips_claimed() -> None:
     gh = InMemoryGitHub()
     a = _queued(gh, title="a")

@@ -104,6 +104,27 @@ class PyGithubAdapter:
             kwargs["assignee"] = assignee
         return _to_issue_ref(self._repo(repo).create_issue(**kwargs))
 
+    def create_label(
+        self,
+        *,
+        repo: str,
+        name: str,
+        color: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> bool:
+        from github import GithubException  # lazy import
+
+        kwargs: dict[str, Any] = {}
+        if description is not None:
+            kwargs["description"] = description
+        try:
+            self._repo(repo).create_label(name=name, color=color or "ededed", **kwargs)
+            return True
+        except GithubException as exc:
+            if exc.status == 422:  # label already exists -> idempotent no-op
+                return False
+            raise
+
     def set_labels(self, *, repo: str, number: int, labels: Sequence[str]) -> IssueRef:
         issue = self._repo(repo).get_issue(number)
         issue.set_labels(*labels)

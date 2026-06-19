@@ -171,8 +171,9 @@ class DiscordRestPoster:
     """Posts a channel message via Discord's REST API using the bot token.
 
     Synchronous and best-effort: a failure raises, and DiscordNotifier swallows it
-    (the gate is already durable in the file inbox). Artifact upload (multipart) is
-    intentionally left to a later refinement — the artifact path is included as text.
+    (the gate is already durable in the file inbox). When the post carries an artifact
+    the body is ``multipart/form-data`` (so the human perceives the file in-channel);
+    otherwise it is plain JSON. A missing/oversized artifact degrades to the text post.
     """
 
     API = "https://discord.com/api/v10"
@@ -182,14 +183,14 @@ class DiscordRestPoster:
         self._timeout = timeout
 
     def __call__(self, post: GatePost) -> Optional[str]:
-        data = json.dumps(to_discord_payload(post)).encode("utf-8")
+        data, content_type = encode_create_message(post, boundary=uuid.uuid4().hex)
         req = urllib.request.Request(
             f"{self.API}/channels/{post.channel_id}/messages",
             data=data,
             method="POST",
             headers={
                 "Authorization": f"Bot {self._token}",
-                "Content-Type": "application/json",
+                "Content-Type": content_type,
                 "User-Agent": "dev-harness (https://github.com/ParthivNair/dev-harness, 0.1)",
             },
         )

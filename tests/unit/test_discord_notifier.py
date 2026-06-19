@@ -7,12 +7,14 @@ the part that must be exactly right.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from harness.adapters.notifier.discord import (
     DiscordNotifier,
     GatePost,
     components_for_schema,
+    encode_create_message,
     parse_custom_id,
     response_payload,
     to_discord_payload,
@@ -66,6 +68,50 @@ def test_to_discord_payload_wraps_buttons_in_an_action_row() -> None:
     assert row["type"] == 1
     assert {b["style"] for b in row["components"]} == {3, 4}  # success, danger
     assert all(b["type"] == 2 for b in row["components"])
+
+
+def test_encode_create_message_is_json_without_artifact() -> None:
+    post = GatePost(channel_id="C", content="hi", artifact_path=None)
+    data, content_type = encode_create_message(post, boundary="B")
+    assert content_type == "application/json"
+    assert json.loads(data.decode("utf-8")) == {"content": "hi"}
+
+
+def test_encode_create_message_falls_back_when_file_missing(tmp_path: Path) -> None:
+    post = GatePost(channel_id="C", content="hi", artifact_path=str(tmp_path / "gone.txt"))
+    data, content_type = encode_create_message(post, boundary="B")
+    assert content_type == "application/json"
+    assert json.loads(data.decode("utf-8")) == {"content": "hi"}
+
+
+def test_encode_create_message_builds_multipart_with_file_bytes(tmp_path: Path) -> None:
+    artifact = tmp_path / "run1_iter2.txt"
+    artifact.write_bytes(b"=== test output ===\nall green\n")
+    post = GatePost(channel_id="C", content="perceive this", artifact_path=str(artifact))
+
+    data, content_type = encode_create_message(post, boundary="BOUND")
+
+    assert content_type == "multipart/form-data; boundary=BOUND"
+    # Both parts are present, with the deterministic boundary delimiting them.
+    assert data.count(b"--BOUND\r\n") == 2
+    assert data.endswith(b"--BOUND--\r\n")
+    # The payload_json part reuses to_discord_payload and declares the attachment.
+    assert b'name="payload_json"' in data
+    expected = to_discord_payload(post)
+    expected["attachments"] = [{"id": 0, "filename": "run1_iter2.txt"}]
+    assert json.dumps(expected).encode("utf-8") in data
+    # The file part carries the name and the raw bytes.
+    assert b'name="files[0]"; filename="run1_iter2.txt"' in data
+    assert b"=== test output ===\nall green\n" in data
+
+
+def test_encode_create_message_degrades_when_artifact_oversized(tmp_path: Path) -> None:
+    artifact = tmp_path / "big.txt"
+    artifact.write_bytes(b"x" * 64)
+    post = GatePost(channel_id="C", content="hi", artifact_path=str(artifact))
+    data, content_type = encode_create_message(post, boundary="B", max_artifact_bytes=16)
+    assert content_type == "application/json"  # too big → text-only, path stays in content
+    assert json.loads(data.decode("utf-8")) == {"content": "hi"}
 
 
 def test_notify_writes_durable_file_then_posts(tmp_path: Path) -> None:

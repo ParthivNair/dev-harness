@@ -74,6 +74,19 @@ class GitHubAdapter(Protocol):
         assignee: Optional[str] = None,
     ) -> IssueRef: ...
 
+    def create_label(
+        self,
+        *,
+        repo: str,
+        name: str,
+        color: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> bool:
+        """Create a repo-level label, idempotently. Returns True if it was newly
+        created, False if it already existed. Bootstraps the ``harness:*`` set on a
+        fresh coordination repo so the first label-by-name read (``list_issues``
+        resolving ``get_label``) does not 404."""
+
     def set_labels(self, *, repo: str, number: int, labels: Sequence[str]) -> IssueRef: ...
 
     def add_labels(self, *, repo: str, number: int, labels: Sequence[str]) -> IssueRef: ...

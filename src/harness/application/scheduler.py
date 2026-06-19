@@ -64,6 +64,7 @@ class SchedulerLedger(BaseModel):
 @dataclass
 class TickReport:
     resumed: list[tuple[str, str]]            # (run_id, status)
+    reconciled: list[tuple[str, int]]         # (project_id, requeued_issue_number)
     started: list[tuple[str, str, str]]       # (project_id, run_id, status)
     window_spend_usd: float
     halted_for_spend: bool
@@ -124,6 +125,9 @@ class Scheduler:
         self._roll_window(ledger, now, sc.spend_window)
 
         resumed = self.resume_waiting()
+        # Crash recovery: requeue our own in-progress issues no run is backing
+        # anymore. After resume_waiting so a just-resumed run still counts as live.
+        reconciled = self._reconcile_orphans()
 
         started: list[tuple[str, str, str]] = []
         window_spend = self._window_spend(ledger)
@@ -135,10 +139,40 @@ class Scheduler:
         self._save_ledger(ledger)
         return TickReport(
             resumed=resumed,
+            reconciled=reconciled,
             started=started,
             window_spend_usd=self._window_spend(ledger),
             halted_for_spend=halted,
         )
+
+    # ------------------------------------------------------------------ #
+    # Crash recovery
+    # ------------------------------------------------------------------ #
+    def _reconcile_orphans(self) -> list[tuple[str, int]]:
+        """Requeue this instance's stranded in-progress issues (dead-owner recovery).
+
+        The liveness signal is the active-run set (never wall-clock age): per owned
+        repo, the issue numbers backing a WAITING/RUNNING run are "live"; any
+        in-progress issue we own that is NOT in that set is released back to queued.
+        """
+        instance_id = self.cfg.instance.instance_id
+        active_by_repo: dict[str, set[int]] = {}
+        for record in self._active_runs():
+            repo = record.data.get("repo")
+            number = record.data.get("issue_number")
+            if repo and number is not None:
+                active_by_repo.setdefault(repo, set()).add(int(number))
+
+        out: list[tuple[str, int]] = []
+        for project in self.registry.list_owned(instance_id):
+            reclaimed = co.reconcile_orphans(
+                self.github,
+                repo=project.repo,
+                instance_id=instance_id,
+                active_run_issue_numbers=active_by_repo.get(project.repo, set()),
+            )
+            out.extend((project.id, number) for number in reclaimed)
+        return out
 
     # ------------------------------------------------------------------ #
     # Starting work

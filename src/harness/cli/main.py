@@ -16,6 +16,7 @@ from typing import Optional
 import typer
 
 from harness import operations
+from harness.application import coordination as co
 from harness.application.ownership import owns
 from harness.application.scheduler import TickReport
 from harness.adapters.notifier.file import FileNotifier
@@ -39,11 +40,13 @@ CONFIG_OPT = typer.Option(None, "--config", "-c", help="Path to harness.toml (el
 def _echo_tick(report: TickReport) -> None:
     for rid, status in report.resumed:
         typer.echo(f"resumed {rid} -> {status}")
+    for pid, number in report.reconciled:
+        typer.echo(f"reconciled {pid} #{number} -> requeued (stale lease)")
     for pid, rid, status in report.started:
         typer.echo(f"started {pid} {rid} -> {status}")
     note = "  (HALTED: spend ceiling reached)" if report.halted_for_spend else ""
     typer.echo(f"window spend: ${report.window_spend_usd:.2f}{note}")
-    if not report.resumed and not report.started:
+    if not report.resumed and not report.reconciled and not report.started:
         typer.echo("nothing to do")
 
 
@@ -82,6 +85,56 @@ def projects(config: Optional[Path] = CONFIG_OPT) -> None:
 
 
 @app.command()
+def queue(
+    project: str = typer.Argument(..., help="Registered project id."),
+    state: Optional[str] = typer.Option(
+        None, "--state", help="Show only one harness state (e.g. 'queued')."
+    ),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Show PROJECT's GitHub board grouped by harness state (read-only).
+
+    Surfaces the real cross-machine work board — the open issues and their
+    ``harness:<state>`` labels that ARE the queue. It never claims, transitions,
+    or relabels, so it works for projects this install does not own and runs
+    token-free against the in-memory fake.
+    """
+    c = build_container(config)
+    repo = c.registry.get(project).repo
+
+    only: Optional[str] = None
+    if state is not None:
+        only = state if state in co.STATE_LABELS else f"harness:{state}"
+        if only not in co.STATE_LABELS:
+            known = ", ".join(sorted(s.removeprefix("harness:") for s in co.STATE_LABELS))
+            typer.echo(f"unknown state '{state}' (try: {known})", err=True)
+            raise typer.Exit(1)
+
+    issues = c.github.list_issues(repo=repo, state="open")
+    by_state: dict[str, list] = {label: [] for label in co.STATE_LABELS}
+    for issue in issues:
+        s = co.state_of(issue)
+        if s is not None:  # plain human-filed issues (no harness label) are omitted
+            by_state[s].append(issue)
+
+    typer.echo(f"queue: {project} ({repo})")
+    shown = 0
+    for label in ([only] if only else sorted(co.STATE_LABELS)):
+        items = by_state[label]
+        if not items and not only:
+            continue  # skip empty groups in the full board; keep it terse
+        typer.echo(f"{label} ({len(items)})")
+        for issue in sorted(items, key=lambda i: i.number):
+            owner = co.owner_of(issue) or "unclaimed"
+            typer.echo(f"  #{issue.number} {issue.title}  [{owner}]")
+        if not items:
+            typer.echo("  (none)")
+        shown += len(items)
+    if shown == 0 and not only:
+        typer.echo("  (no harness-labeled issues)")
+
+
+@app.command()
 def run(
     loop: str = typer.Argument("demo", help="Loop name: 'demo' or 'dev_task'."),
     project: str = typer.Argument(..., help="Registered project id."),
@@ -107,6 +160,51 @@ def run(
     typer.echo(f"created run {record.run_id}")
     status = operations.execute_run(c, loop_name=loop, project_id=project, run_id=record.run_id)
     _report(c, record.run_id, status)
+
+
+@app.command(name="labels-init")
+def labels_init(
+    project: str = typer.Argument(..., help="Registered project id."),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Bootstrap the harness:* label set on PROJECT's repo (first-run setup).
+
+    Ensures every harness:<state> label exists, creating any that are missing so
+    the first ``list_issues(labels=[harness:queued])`` does not 404 resolving the
+    label by name. Idempotent — a clean no-op once they all exist. Refuses for
+    projects this install does not own.
+    """
+    c = build_container(config)
+    try:
+        created = operations.init_labels(c, project_id=project)
+    except operations.NotOwned as exc:
+        typer.echo(f"refusing: {exc}. Reads are fine; acting is not.", err=True)
+        raise typer.Exit(1)
+    if created:
+        typer.echo(f"created {len(created)} label(s): {', '.join(created)}")
+    else:
+        typer.echo("all harness labels already present; nothing to do")
+
+
+@app.command()
+def cancel(
+    project: str = typer.Argument(..., help="Registered project id."),
+    issue: int = typer.Argument(..., help="Issue number to release and requeue."),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Release an issue's lease and requeue it (back to harness:queued, owner dropped).
+
+    For a stuck or wrongly-claimed issue. Touches GitHub labels ONLY — it does not
+    abort a local run working that issue (use `harness show`/the dashboard for runs).
+    Idempotent: cancelling an already-queued or unowned issue just re-asserts the queue.
+    """
+    c = build_container(config)
+    try:
+        ref = operations.cancel_issue(c, project_id=project, number=issue)
+    except operations.NotOwned as exc:
+        typer.echo(f"refusing: {exc}. Reads are fine; acting is not.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"issue #{issue}: state={co.state_of(ref)} owner={co.owner_of(ref)}")
 
 
 @app.command()

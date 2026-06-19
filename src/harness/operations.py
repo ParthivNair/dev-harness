@@ -83,6 +83,29 @@ def create_run_for(
     return runner.create_run(project_id=project_id, breakers=breakers_for(c.cfg, proj), data=data)
 
 
+def init_labels(c: Container, *, project_id: str) -> list[str]:
+    """Bootstrap the ``harness:<state>`` label set on an owned project's repo.
+
+    A fresh coordination repo has no ``harness:*`` labels, so the first
+    ``find_claimable`` -> ``list_issues(labels=[harness:queued])`` 404s while
+    resolving the label by name. This ensures every label in
+    :data:`coordination.STATE_LABELS` exists, creating the missing ones. Idempotent:
+    re-running creates nothing. Returns the labels it created (empty on a clean
+    no-op), in deterministic order.
+    """
+    proj = c.registry.get(project_id)
+    if not owns(proj, c.cfg.instance):
+        raise NotOwned(
+            f"instance '{c.cfg.instance.instance_id}' does not own project "
+            f"'{project_id}' (owner: {proj.owner_instance})"
+        )
+    return [
+        name
+        for name in sorted(co.STATE_LABELS)
+        if c.github.create_label(repo=proj.repo, name=name)
+    ]
+
+
 def execute_run(c: Container, *, loop_name: str, project_id: Optional[str], run_id: str) -> RunStatus:
     """Dispatch a CREATED/RUNNING run to its next gate or terminal state.
 

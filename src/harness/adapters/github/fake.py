@@ -17,6 +17,7 @@ class InMemoryGitHub:
     def __init__(self) -> None:
         self._issues: dict[tuple[str, int], IssueRef] = {}
         self._pulls: dict[tuple[str, int], PullRef] = {}
+        self._labels: dict[str, set[str]] = {}  # repo -> created repo-level label names
         self._next_issue = 1
         self._next_pull = 1000
 
@@ -79,6 +80,20 @@ class InMemoryGitHub:
         )
         self._issues[(repo, number)] = issue
         return issue
+
+    def create_label(
+        self,
+        *,
+        repo: str,
+        name: str,
+        color: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> bool:
+        created = self._labels.setdefault(repo, set())
+        if name in created:
+            return False
+        created.add(name)
+        return True
 
     def set_labels(self, *, repo: str, number: int, labels: Sequence[str]) -> IssueRef:
         issue = self._issues[(repo, number)]
