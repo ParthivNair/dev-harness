@@ -13,7 +13,9 @@ Rubric:
 2. **Durability & idempotency.** Are run/ledger writes atomic (temp + `os.replace`)? Do
    steps tolerate at-least-once execution? Is any resume position a closure/stack frame
    instead of plain data (`current_step` + `data`)?
-3. **Structural safety.** Is there still no merge/push/force-push method on the GitHub port?
+3. **Structural safety.** Merge now exists (`merge_pull`) but must stay reachable ONLY via the
+   `ActionGuard` with a per-repo opt-in (`merge_to_main` is `forbidden` in the instance default).
+   Is there still no push/force-push method, and does the Executor still refuse to push trunks?
    Does `open_draft_pr` stay hard-wired to `draft=True`? Are forbidden actions unreachable?
 4. **Circuit breakers & spend.** Are per-run caps and the global spend window both enforced
    and persisted across crashes? Any path that could reset a budget or escape a cap?

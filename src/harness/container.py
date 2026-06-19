@@ -35,6 +35,7 @@ from harness.domain.models import BreakerState, RunStatus
 from harness.loops.arch_review import build_arch_review_loop
 from harness.loops.demo import build_demo_loop
 from harness.loops.dev_task import build_dev_loop
+from harness.loops.pr_review import build_pr_review_loop
 from harness.loops.triage import build_triage_loop
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
@@ -179,9 +180,22 @@ def build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig])
             project=project,
             project_root=project_root(c, project.id),
         )
+    elif loop_name == "pr_review":
+        if project is None:
+            raise UnknownLoop("the pr_review loop needs a project")
+        loop = build_pr_review_loop(
+            executor=c.executor,
+            github=c.github,
+            guard=_guard_for(c, project),  # per-repo guard: honors merge_to_main opt-in
+            project=project,
+            instance_id=c.cfg.instance.instance_id,
+            project_root=project_root(c, project.id),
+            artifacts_dir=c.store.root / "artifacts",
+        )
     else:
         raise UnknownLoop(
-            f"unknown loop '{loop_name}' (try 'demo', 'dev_task', 'arch_review', or 'triage')"
+            f"unknown loop '{loop_name}' "
+            "(try 'demo', 'dev_task', 'arch_review', 'triage', or 'pr_review')"
         )
     return LoopRunner(loop, c.store, c.notifier)
 

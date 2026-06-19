@@ -1,6 +1,6 @@
 # The harness as a managed project OF ITSELF (dogfooding). The repo root IS the
-# managed repo, so the dev loop can propose the harness's own next milestone as a
-# DRAFT PR a human merges — it cannot merge, push, or force-push (no port exists).
+# managed repo: the dev loop proposes the harness's own next milestone as a DRAFT PR,
+# and the pr_review loop reviews + (per the opt-in below) MERGES it — closing the loop.
 # The pytest suite is the `test` step, i.e. the self-modification safety net.
 schema_version = 1
 
@@ -9,7 +9,7 @@ id = "dev-harness"
 display_name = "dev-harness (self-managed)"
 repo = "ParthivNair/dev-harness"
 owner_instance = "WindowsDesktop"    # the Windows install owns it; the Mac reads it
-description = "The harness manages its own next milestone — draft PRs a human merges."
+description = "The harness manages its own next milestone — and (opted in) reviews + merges its own wave PRs."
 
 [commands]
 build = ["uv", "run", "python", "-c", "import harness"]   # import smoke
@@ -20,6 +20,7 @@ cwd = "."
 root = ".harness/prompts"
 dev_task = ".harness/prompts/dev_task.md"
 arch_review = ".harness/prompts/arch_review.md"
+pr_review = ".harness/prompts/pr_review.md"
 triage = ".harness/prompts/triage.md"
 
 [scheduling]
@@ -28,6 +29,8 @@ min_poll_interval_seconds = 1800       # at most every 30 min
 loops = ["dev_task"]
 arch_review_cadence_seconds = 86400    # review itself ~daily, files its own tickets
 triage_cadence_seconds = 3600          # groom the backlog hourly: refine sev:/effort: labels
+pr_review_cadence_seconds = 1800       # review + merge its own aggregated wave PR every ~30 min
+pr_merge_method = "squash"             # how a merged wave PR lands on main
 
 [claude]
 model = "claude-opus-4-8"
@@ -36,13 +39,17 @@ permission_mode = "acceptEdits"
 # it edits the working tree and the harness opens the draft PR via the GitHub API.
 disallowed_tools = ["Bash(git push:*)", "Bash(git commit:*)"]
 
-# This repo is SELF-MANAGED: it is reviewed at the (wave) PR by a separate agent
-# session, not via a mid-run human gate. So it opts the two normally-gated actions
-# into autonomous — overriding ONLY for this project; the instance defaults in
-# harness.toml stay safe (gated) for human-reviewed repos like the DAW.
+# This repo is SELF-MANAGED: it is reviewed at the (wave) PR by the pr_review agent,
+# not via a mid-run human gate. So it opts the normally-gated actions into autonomous —
+# overriding ONLY for this project; the instance defaults in harness.toml stay safe
+# (gated/forbidden) for human-reviewed repos like the DAW. This closes the loop:
 #   verify_gate   -> skip the mid-run "perceive the result" gate; flow to publish.
 #   mark_pr_ready -> the overseer promotes the aggregated wave PR draft -> ready.
-# The harness STILL cannot merge; promotion to ready is the most it does.
+#   merge_to_main -> the pr_review loop reviews that wave PR and MERGES it to main.
+# The hard pre-merge bar still holds: mergeable + green CI + an AI review with no
+# blocking issues, and only THIS instance's own wave PRs. Dial merge_to_main back to
+# "gated" for a human approve per merge, or remove it to revert to human-merge.
 [overrides.autonomy]
 verify_gate = "autonomous"
 mark_pr_ready = "autonomous"
+merge_to_main = "autonomous"

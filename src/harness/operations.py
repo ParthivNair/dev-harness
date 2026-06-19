@@ -55,7 +55,12 @@ _RECENT_LIMIT = 15
 # Write use-cases
 # --------------------------------------------------------------------------- #
 def create_run_for(
-    c: Container, *, loop: str, project_id: str, issue: Optional[int] = None
+    c: Container,
+    *,
+    loop: str,
+    project_id: str,
+    issue: Optional[int] = None,
+    pr: Optional[int] = None,
 ) -> RunRecord:
     """Validate ownership, resolve dev_task work, and persist a CREATED run.
 
@@ -77,6 +82,8 @@ def create_run_for(
         if number is None:
             raise NoQueuedWork(f"no queued work for '{project_id}' ({proj.repo})")
         data = {"issue_number": number, "repo": proj.repo}
+    elif loop == "pr_review" and pr is not None:
+        data = {"pr_number": pr}  # explicit target; else the loop auto-selects
 
     runner = build_runner(c, loop, proj)
     return runner.create_run(project_id=project_id, breakers=breakers_for(c.cfg, proj), data=data)
@@ -96,10 +103,15 @@ def execute_run(c: Container, *, loop_name: str, project_id: Optional[str], run_
 
 
 def start_run(
-    c: Container, *, loop: str, project_id: str, issue: Optional[int] = None
+    c: Container,
+    *,
+    loop: str,
+    project_id: str,
+    issue: Optional[int] = None,
+    pr: Optional[int] = None,
 ) -> tuple[RunRecord, RunStatus]:
     """create + execute, inline. Convenience for the CLI's one-shot ``run`` command."""
-    record = create_run_for(c, loop=loop, project_id=project_id, issue=issue)
+    record = create_run_for(c, loop=loop, project_id=project_id, issue=issue, pr=pr)
     status = execute_run(c, loop_name=loop, project_id=project_id, run_id=record.run_id)
     return record, status
 

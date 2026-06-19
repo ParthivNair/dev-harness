@@ -44,6 +44,12 @@ STATE_LABELS = frozenset(
 )
 OWNER_PREFIX = "harness:owner:"
 
+# A non-state marker applied to a PULL (not an issue): the pr_review loop tags a wave
+# PR it reviewed but would not merge (changes requested, failing CI, or unmergeable), so
+# the next selection pass skips it instead of re-reviewing the same unchanged PR.
+# Deliberately NOT in STATE_LABELS — it lives on PRs, outside the issue state machine.
+CHANGES_REQUESTED = "harness:changes-requested"
+
 # A FOREIGN marker label (deliberately NOT in STATE_LABELS) so it rides through
 # state transitions like any human tag. Stamped when a stranded/aborted run is
 # requeued for a fresh attempt, so a continuation is visible on the board.
@@ -274,3 +280,26 @@ def find_claimable(
     # severity desc, effort asc, number asc — deterministic and total.
     ready.sort(key=lambda i: (-severity_score(i), effort_rank(i), i.number))
     return ready[0].number
+
+
+def is_harness_wave_pr(head: Optional[str], instance_id: str) -> bool:
+    """True iff a PR head branch is one of THIS instance's aggregated wave branches
+    (``harness/<instance_id>/wave-<id>``) — the overseer's wave PRs that the pr_review
+    loop reviews and merges. Instance-scoped so two machines never race on a PR, and a
+    human's branch (or a bare per-issue ``issue-N`` branch) is never matched."""
+    return bool(re.match(rf"^harness/{re.escape(instance_id)}/wave-", head or ""))
+
+
+def find_reviewable_pr(
+    github: GitHubAdapter, *, repo: str, instance_id: str
+) -> Optional[int]:
+    """Lowest open WAVE PR authored by THIS instance that is not already flagged
+    :data:`CHANGES_REQUESTED`. The pr_review analogue of :func:`find_claimable`;
+    returns the PR number, or None if there's nothing to review."""
+    numbers = [
+        pr.number
+        for pr in github.list_pulls(repo=repo, state="open")
+        if CHANGES_REQUESTED not in pr.labels
+        and is_harness_wave_pr(pr.head, instance_id)
+    ]
+    return min(numbers) if numbers else None

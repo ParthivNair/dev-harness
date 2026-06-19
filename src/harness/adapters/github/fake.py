@@ -7,10 +7,18 @@ double used in tests. ``open_draft_pr`` asserts the draft invariant structurally
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import Optional, Sequence
 
-from harness.ports.github import IssueRef, PRState, PullRef
+from harness.ports.github import (
+    ChecksState,
+    IssueRef,
+    PRState,
+    PullChecks,
+    PullRef,
+    ReviewEvent,
+)
 
 
 class InMemoryGitHub:
@@ -21,6 +29,11 @@ class InMemoryGitHub:
         self.comments: dict[tuple[str, int], list[str]] = {}
         self._next_issue = 1
         self._next_pull = 1000
+        # pr_review state: per-PR review diff, CI rollup, and posted reviews.
+        self._diffs: dict[tuple[str, int], str] = {}
+        self._checks: dict[tuple[str, int], ChecksState] = {}
+        self._reviews: dict[tuple[str, int], list[tuple[ReviewEvent, str]]] = {}
+        self._merges: dict[tuple[str, int], str] = {}  # (repo, number) -> merge method used
 
     # ---- reads ----
     def list_issues(
@@ -97,9 +110,23 @@ class InMemoryGitHub:
         return updated
 
     def add_labels(self, *, repo: str, number: int, labels: Sequence[str]) -> IssueRef:
-        issue = self._issues[(repo, number)]
-        merged = tuple(dict.fromkeys((*issue.labels, *labels)))
-        return self.set_labels(repo=repo, number=number, labels=merged)
+        key = (repo, number)
+        if key in self._issues:
+            issue = self._issues[key]
+            merged = tuple(dict.fromkeys((*issue.labels, *labels)))
+            return self.set_labels(repo=repo, number=number, labels=merged)
+        # GitHub shares the issue/PR number space, so add_labels also targets PRs
+        # (the pr_review loop tags a PR ``harness:changes-requested``). The fake keeps
+        # them in separate dicts, so resolve to the pull and synthesize the IssueRef view.
+        if key in self._pulls:
+            pr = self._pulls[key]
+            merged = tuple(dict.fromkeys((*pr.labels, *labels)))
+            self._pulls[key] = replace(pr, labels=merged)
+            return IssueRef(
+                number=pr.number, title=pr.title, state=pr.state.value,
+                labels=merged, assignee=None, url=pr.url,
+            )
+        raise KeyError(key)
 
     def assign_issue(self, *, repo: str, number: int, assignee: str) -> IssueRef:
         issue = self._issues[(repo, number)]
@@ -131,21 +158,69 @@ class InMemoryGitHub:
             mergeable=None,
             labels=(),
             url=f"https://github.com/{repo}/pull/{number}",
+            head=head,
+            body=body,
         )
         self._pulls[(repo, number)] = pr
         return pr
 
-    # ---- gated write ----
+    def get_pull_diff(self, *, repo: str, number: int) -> str:
+        return self._diffs.get((repo, number), f"[fake] diff for PR #{number}")
+
+    def get_pull_checks(self, *, repo: str, number: int) -> PullChecks:
+        # Default: NONE (no CI configured) — passes the green-CI bar vacuously.
+        return PullChecks(state=self._checks.get((repo, number), ChecksState.NONE))
+
+    def review_pull(
+        self, *, repo: str, number: int, body: str, event: ReviewEvent
+    ) -> None:
+        self._reviews.setdefault((repo, number), []).append((event, body))
+
+    # ---- gated / opt-in writes ----
     def mark_pr_ready(self, *, repo: str, number: int) -> PullRef:
         pr = self._pulls[(repo, number)]
-        updated = PullRef(
-            number=pr.number,
-            title=pr.title,
-            state=pr.state,
-            draft=False,
-            mergeable=pr.mergeable,
-            labels=pr.labels,
-            url=pr.url,
+        updated = replace(pr, draft=False)
+        self._pulls[(repo, number)] = updated
+        return updated
+
+    def merge_pull(
+        self, *, repo: str, number: int, method: str = "squash"
+    ) -> PullRef:
+        pr = self._pulls[(repo, number)]
+        updated = replace(pr, state=PRState.MERGED, draft=False)
+        self._pulls[(repo, number)] = updated
+        self._merges[(repo, number)] = method
+        return updated
+
+    # ---- test helpers (not part of the port) ----
+    def set_pull(
+        self,
+        *,
+        repo: str,
+        number: int,
+        mergeable: Optional[bool] = None,
+        draft: Optional[bool] = None,
+        state: Optional[PRState] = None,
+    ) -> PullRef:
+        """Mutate a PR's merge-relevant fields so tests can drive the loop."""
+        pr = self._pulls[(repo, number)]
+        updated = replace(
+            pr,
+            mergeable=pr.mergeable if mergeable is None else mergeable,
+            draft=pr.draft if draft is None else draft,
+            state=pr.state if state is None else state,
         )
         self._pulls[(repo, number)] = updated
         return updated
+
+    def set_pull_checks(self, *, repo: str, number: int, state: ChecksState) -> None:
+        self._checks[(repo, number)] = state
+
+    def set_pull_diff(self, *, repo: str, number: int, diff: str) -> None:
+        self._diffs[(repo, number)] = diff
+
+    def reviews_for(self, *, repo: str, number: int) -> list[tuple[ReviewEvent, str]]:
+        return list(self._reviews.get((repo, number), []))
+
+    def merge_method_for(self, *, repo: str, number: int) -> Optional[str]:
+        return self._merges.get((repo, number))
