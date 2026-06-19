@@ -1,12 +1,19 @@
 """The real dev/test loop — the harness's "junior dev".
 
-    claim_issue -> generate -> build -> test -> verify_gate -> open_pr -> finish
+    claim_issue -> generate -> build -> test -> verify_gate -> publish -> finish
 
 It pulls a ``harness:queued`` issue (claimed via the lease in
 :mod:`harness.application.coordination`), runs Claude on the project's
 ``dev_task`` prompt, builds and tests (looping back with the failure log as
-context on any failure), gates the human to *perceive* the result, then opens a
-**draft** PR and flips labels. The merge is structurally never ours.
+context on any failure), optionally gates the human to *perceive* the result,
+then **publishes the feature branch**. The loop opens NO PR of its own — a
+COMPLETED dev_task run means "branch published, ready to aggregate". The single
+aggregated wave PR is the overseer's job (see :mod:`harness.application.overseer`).
+
+The ``verify_gate`` is consulted via the autonomy taxonomy: a project that marks
+``verify_gate`` autonomous flows straight to ``publish`` (still writing the
+perceptual artifact + test output for the record); a gated project keeps the
+human ``require_verification`` path. The merge is structurally never ours.
 
 Iteration accounting: ``start_step="claim_issue"``. Every failure / reject path
 returns to ``claim_issue`` (the start step), so each loop-back ticks
@@ -24,8 +31,10 @@ from harness.application import coordination as co
 from harness.application.action_guard import ActionGuard, ActionRequest, GateRequired
 from harness.application.loop_runner import LoopDefinition, RunContext, StepOutcome
 from harness.config.models import ProjectConfig
+from harness.domain.models import TERMINAL_STATUSES, RunRecord
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
+from harness.ports.run_store import RunStore
 
 DEV_ANSWER_SCHEMA = {
     "type": "object",
@@ -39,7 +48,8 @@ DEV_ANSWER_SCHEMA = {
 
 DEFAULT_DEV_PROMPT = (
     "Implement the change described in the linked issue. Run the project's tests. "
-    "Open a draft PR. Do not touch `main`; do not force-push."
+    "Leave the change on a feature branch (the harness publishes it and aggregates "
+    "it into one wave PR). Do not touch `main`; do not force-push."
 )
 
 _MAX_LOG = 4000  # cap failure logs fed back into the next prompt
@@ -57,8 +67,12 @@ def _read_prompt(project_root: Path, project: ProjectConfig) -> str:
 
 
 def _compose_prompt(base_prompt: str, issue_title: str, issue_body: str,
-                    last_failure: Optional[dict]) -> str:
+                    last_failure: Optional[dict], handoff: Optional[str] = None) -> str:
     parts = [base_prompt, "", f"## Task (issue): {issue_title}", issue_body or "(no description)"]
+    if handoff:
+        # A FRESH run continuing a previously stranded/aborted attempt: the prior
+        # attempt's context is fed in so Claude continues the work, not restarts cold.
+        parts += ["", handoff]
     if last_failure:
         phase = last_failure.get("phase", "?")
         parts += ["", f"## Previous attempt failed at: {phase}", "Fix it. Details:"]
@@ -67,6 +81,38 @@ def _compose_prompt(base_prompt: str, issue_title: str, issue_body: str,
             if val:
                 parts.append(f"[{key}]\n{val}")
     return "\n".join(parts)
+
+
+def _handoff_context(store: RunStore, repo: str, number: int) -> Optional[str]:
+    """A "## Prior attempt(s)" block derived from prior TERMINAL dev_task runs for
+    this issue, or None if this is the first attempt. Lets a requeued (handed-off)
+    issue continue where the last run left off instead of starting from scratch."""
+    priors = [
+        r
+        for r in store.list()
+        if r.loop_name == "dev_task"
+        and r.data.get("repo") == repo
+        and r.data.get("issue_number") == number
+        and r.status in TERMINAL_STATUSES
+    ]
+    if not priors:
+        return None
+    priors.sort(key=lambda r: r.created_at)
+    latest: RunRecord = priors[-1]
+    lines = [
+        "## Prior attempt(s)",
+        f"{len(priors)} prior attempt(s); the most recent ended "
+        f"**{latest.status.value}** (reason: {latest.terminal_reason or 'n/a'}).",
+        f"- branch: `{latest.data.get('branch', '?')}`",
+    ]
+    last_failure = latest.data.get("last_failure")
+    if last_failure:
+        lines.append(f"- last failure at: {last_failure.get('phase', '?')}")
+    claude_result = latest.data.get("claude_result")
+    if claude_result:
+        lines += ["", "### What was tried last", str(claude_result)[:2000]]
+    lines += ["", "Continue this work; do not restart from scratch."]
+    return "\n".join(lines)
 
 
 def build_dev_loop(
@@ -78,6 +124,7 @@ def build_dev_loop(
     instance_id: str,
     project_root: Path,
     artifacts_dir: Path,
+    store: RunStore,
 ) -> LoopDefinition:
     artifacts_dir = Path(artifacts_dir)
     base_prompt = _read_prompt(project_root, project)
@@ -100,7 +147,10 @@ def build_dev_loop(
     def generate(ctx: RunContext) -> StepOutcome:
         repo, number = _repo_and_number(ctx)
         issue = github.get_issue(repo=repo, number=number)
-        prompt = _compose_prompt(base_prompt, issue.title, issue.body, ctx.data.get("last_failure"))
+        handoff = _handoff_context(store, repo, number)
+        prompt = _compose_prompt(
+            base_prompt, issue.title, issue.body, ctx.data.get("last_failure"), handoff
+        )
         result = executor.run_claude_task(project=project, prompt=prompt)
         ctx.record_cost(result.total_cost_usd, result.input_tokens, result.output_tokens)
         return StepOutcome(
@@ -158,6 +208,16 @@ def build_dev_loop(
     def verify_gate(ctx: RunContext) -> StepOutcome:
         answer = ctx.answer_for(ctx.step_id)
         if answer is None:
+            # Consult the autonomy policy. A project that marks verify_gate autonomous
+            # (a self-managed repo reviewed at the PR, not mid-run) skips the human gate
+            # and flows straight to publish — the perceptual artifact + test output were
+            # already written in `test`, so the record stays complete. A gated project
+            # raises GateRequired and keeps the existing human require_verification path.
+            try:
+                guard.admit(ActionRequest("verify_gate", project.id))
+                return StepOutcome(next_step="publish", output={"auto_verified": True})
+            except GateRequired:
+                pass
             repo, number = _repo_and_number(ctx)
             co.transition(github, repo=repo, number=number, to_state=co.NEEDS_VERIFICATION)
             branch = ctx.data.get("branch")
@@ -166,7 +226,8 @@ def build_dev_loop(
                     f"Issue #{number}: {ctx.data.get('issue_title', '')}\n"
                     f"Branch `{branch}` built and tested green. Pull it, run the app, and "
                     f"confirm the change behaves correctly (perceive what tests cannot). "
-                    f"Approve to open a draft PR; reject with notes to iterate."
+                    f"Approve to publish the branch (the harness aggregates it into one "
+                    f"wave PR); reject with notes to iterate."
                 ),
                 answer_schema=DEV_ANSWER_SCHEMA,
                 artifact_path=ctx.data.get("artifact_path"),
@@ -183,60 +244,29 @@ def build_dev_loop(
         )
 
     def publish(ctx: RunContext) -> StepOutcome:
-        # Commit the working-tree edits and push the feature branch so the PR can
-        # reference it. The Executor refuses trunks / force-pushes; a human merges.
-        _repo_and_number(ctx)
-        number = int(ctx.data["issue_number"])
+        # Commit the working-tree edits and push the feature branch. This is the loop's
+        # work product: the overseer aggregates published branches into ONE wave PR, so
+        # the loop opens no PR of its own. The Executor refuses trunks / force-pushes; a
+        # human still merges. The issue moves to PR_OPEN ("branch published, ready to
+        # aggregate"), the published state the wave-completion check waits to drain.
+        repo, number = _repo_and_number(ctx)
         branch = ctx.data.get("branch", f"harness/{instance_id}/issue-{number}")
         title = ctx.data.get("issue_title") or f"issue #{number}"
         result = executor.publish_branch(
             project=project, branch=branch, commit_message=f"harness: {title} (#{number})"
         )
-        return StepOutcome(
-            next_step="open_pr",
-            state_patch={"publish_stdout": result.stdout},
-            output={"branch": branch},
-        )
-
-    def open_pr(ctx: RunContext) -> StepOutcome:
-        repo, number = _repo_and_number(ctx)
-        # Consult the autonomy policy. open_draft_pr is autonomous by default; if a
-        # project demoted it to gated, escalate to a human gate (re-entry pattern).
-        try:
-            guard.admit(ActionRequest("open_draft_pr", project.id))
-        except GateRequired:
-            answer = ctx.answer_for(ctx.step_id)
-            if answer is None:
-                ctx.require_verification(
-                    prompt=f"Open the draft PR for issue #{number}?",
-                    answer_schema=DEV_ANSWER_SCHEMA,
-                    default_answer={"approved": False},
-                    timeout_seconds=86_400,
-                )
-            if not answer.approved:
-                return StepOutcome(next_step=None, output={"pr_declined": True})
-
-        branch = ctx.data.get("branch", f"harness/{instance_id}/issue-{number}")
-        title = ctx.data.get("issue_title") or f"Resolve issue #{number}"
-        body = (
-            f"Resolves #{number}.\n\n"
-            f"{ctx.data.get('claude_result', '')}\n\n"
-            f"---\nDraft opened autonomously by the harness (`{instance_id}`). "
-            f"A human reviews and merges — the harness cannot."
-        )
-        pr = github.open_draft_pr(repo=repo, head=branch, base="main", title=title, body=body)
         co.transition(github, repo=repo, number=number, to_state=co.PR_OPEN)
         return StepOutcome(
             next_step="finish",
-            state_patch={"pr_url": pr.url, "pr_number": pr.number},
-            output={"pr_url": pr.url, "pr_number": pr.number},
+            state_patch={"publish_stdout": result.stdout, "published": True},
+            output={"branch": branch},
         )
 
     def finish(ctx: RunContext) -> StepOutcome:
         return StepOutcome(
             next_step=None,
             state_patch={"completed": True},
-            output={"pr_url": ctx.data.get("pr_url")},
+            output={"branch": ctx.data.get("branch")},
         )
 
     return LoopDefinition(
@@ -249,7 +279,6 @@ def build_dev_loop(
             "test": test,
             "verify_gate": verify_gate,
             "publish": publish,
-            "open_pr": open_pr,
             "finish": finish,
         },
     )

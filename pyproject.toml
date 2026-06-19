@@ -60,7 +60,8 @@ packages = ["harness"]
 module = "discord.*"
 ignore_missing_imports = true
 
-# fastapi/uvicorn are the optional `web` extra (only the dashboard imports them).
+# fastapi/uvicorn (and their starlette dependency) are the optional `web` extra
+# (only the dashboard imports them).
 [[tool.mypy.overrides]]
-module = ["fastapi.*", "uvicorn.*"]
+module = ["fastapi.*", "uvicorn.*", "starlette.*"]
 ignore_missing_imports = true

@@ -19,6 +19,7 @@ from typing import Optional
 from harness.application import coordination as co
 from harness.application.action_guard import ActionGuard
 from harness.application.loop_runner import LoopDefinition, LoopRunner
+from harness.application.overseer import Overseer
 from harness.application.scheduler import Scheduler
 from harness.adapters.executor.echo import EchoExecutor
 from harness.adapters.executor.subprocess_executor import SubprocessExecutor
@@ -34,6 +35,7 @@ from harness.domain.models import BreakerState, RunStatus
 from harness.loops.arch_review import build_arch_review_loop
 from harness.loops.demo import build_demo_loop
 from harness.loops.dev_task import build_dev_loop
+from harness.loops.triage import build_triage_loop
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
 from harness.ports.notifier import Notifier
@@ -41,7 +43,7 @@ from harness.ports.project_registry import ProjectRegistry
 
 
 class UnknownLoop(ValueError):
-    """A loop name with no builder (not 'demo', 'dev_task', or 'arch_review')."""
+    """A loop name with no builder (not 'demo', 'dev_task', 'arch_review', or 'triage')."""
 
 
 @dataclass
@@ -122,6 +124,14 @@ def project_root(c: Container, project_id: str) -> Path:
     raise KeyError(project_id)
 
 
+def _guard_for(c: Container, project: ProjectConfig) -> ActionGuard:
+    """A project-scoped ActionGuard: the instance autonomy taxonomy with this
+    project's ``[overrides.autonomy]`` layered on top. This is how a self-managed
+    repo opts a normally-gated action (``verify_gate``, ``mark_pr_ready``) into
+    autonomous WITHOUT loosening the safe instance defaults for every other repo."""
+    return ActionGuard(project.effective_autonomy(c.cfg.autonomy))
+
+
 def breakers_for(cfg: HarnessConfig, project: ProjectConfig) -> BreakerState:
     cb = project.effective_breakers(cfg.circuit_breakers)
     return BreakerState(max_iterations=cb.max_iterations, budget_ceiling_usd=cb.spend_ceiling_usd)
@@ -142,11 +152,12 @@ def build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig])
         loop = build_dev_loop(
             executor=c.executor,
             github=c.github,
-            guard=c.guard,
+            guard=_guard_for(c, project),
             project=project,
             instance_id=c.cfg.instance.instance_id,
             project_root=project_root(c, project.id),
             artifacts_dir=c.store.root / "artifacts",
+            store=c.store,
         )
     elif loop_name == "arch_review":
         if project is None:
@@ -154,15 +165,36 @@ def build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig])
         loop = build_arch_review_loop(
             executor=c.executor,
             github=c.github,
-            guard=c.guard,
+            guard=_guard_for(c, project),
+            project=project,
+            project_root=project_root(c, project.id),
+        )
+    elif loop_name == "triage":
+        if project is None:
+            raise UnknownLoop("the triage loop needs a project")
+        loop = build_triage_loop(
+            executor=c.executor,
+            github=c.github,
+            guard=_guard_for(c, project),
             project=project,
             project_root=project_root(c, project.id),
         )
     else:
         raise UnknownLoop(
-            f"unknown loop '{loop_name}' (try 'demo', 'dev_task', or 'arch_review')"
+            f"unknown loop '{loop_name}' (try 'demo', 'dev_task', 'arch_review', or 'triage')"
         )
     return LoopRunner(loop, c.store, c.notifier)
+
+
+def build_overseer(c: Container) -> Overseer:
+    return Overseer(
+        cfg=c.cfg,
+        store=c.store,
+        github=c.github,
+        registry=c.registry,
+        executor=c.executor,
+        notifier=c.notifier,
+    )
 
 
 def build_scheduler(c: Container) -> Scheduler:
@@ -174,6 +206,7 @@ def build_scheduler(c: Container) -> Scheduler:
         notifier=c.notifier,
         runner_factory=lambda loop_name, project: build_runner(c, loop_name, project),
         breakers_factory=lambda project: breakers_for(c.cfg, project),
+        overseer=build_overseer(c),
         ledger_path=c.store.root / "scheduler.json",
     )
 

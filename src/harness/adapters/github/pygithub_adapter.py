@@ -119,6 +119,9 @@ class PyGithubAdapter:
         issue.add_to_assignees(assignee)
         return _to_issue_ref(self._repo(repo).get_issue(number))
 
+    def comment_on_issue(self, *, repo: str, number: int, body: str) -> None:
+        self._repo(repo).get_issue(number).create_comment(body)
+
     def open_draft_pr(
         self, *, repo: str, head: str, base: str, title: str, body: str
     ) -> PullRef:

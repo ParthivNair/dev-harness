@@ -29,14 +29,15 @@ The clock is injectable so cadence/window logic is deterministically testable.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
 from harness.application import coordination as co
 from harness.application.loop_runner import LoopRunner
+from harness.application.overseer import Overseer
 from harness.config.models import HarnessConfig, ProjectConfig
 from harness.domain.models import BreakerState, RunRecord, RunStatus
 from harness.ports.github import GitHubAdapter
@@ -51,6 +52,19 @@ RunnerFactory = Callable[[str, Optional[ProjectConfig]], LoopRunner]
 BreakersFactory = Callable[[ProjectConfig], BreakerState]
 
 
+class WaveState(BaseModel):
+    """The currently-open wave: the batch of dev_task runs worked through one
+    backlog drain. The overseer opens it when the first run starts, registers each
+    run as it begins, and — once every run is terminal and the queue is drained —
+    drafts ONE aggregated PR and flips ``status`` to ``pr_drafted``."""
+
+    wave_id: str
+    opened_at: float
+    run_ids: list[str] = Field(default_factory=list)
+    status: Literal["open", "pr_drafted"] = "open"
+    pr_url: Optional[str] = None
+
+
 class SchedulerLedger(BaseModel):
     """Durable, plain-data scheduler state. Round-trips through JSON like RunRecord."""
 
@@ -58,7 +72,9 @@ class SchedulerLedger(BaseModel):
     window_run_ids: list[str] = Field(default_factory=list)   # runs started this window
     last_started: dict[str, float] = Field(default_factory=dict)       # project -> epoch
     last_arch_review: dict[str, float] = Field(default_factory=dict)   # project -> epoch
+    last_triage: dict[str, float] = Field(default_factory=dict)        # project -> epoch
     started_count: dict[str, int] = Field(default_factory=dict)        # project -> starts/window
+    current_wave: Optional[WaveState] = None                           # the open wave, if any
 
 
 @dataclass
@@ -67,6 +83,9 @@ class TickReport:
     started: list[tuple[str, str, str]]       # (project_id, run_id, status)
     window_spend_usd: float
     halted_for_spend: bool
+    reconciled: list[int] = field(default_factory=list)            # stranded leases requeued
+    handed_off: list[tuple[int, str]] = field(default_factory=list)  # (issue, reason)
+    wave_pr: Optional[str] = None                                  # wave draft PR url, if drafted
 
 
 class Scheduler:
@@ -80,6 +99,7 @@ class Scheduler:
         notifier: Notifier,
         runner_factory: RunnerFactory,
         breakers_factory: BreakersFactory,
+        overseer: Overseer,
         ledger_path: Path,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -90,14 +110,28 @@ class Scheduler:
         self.notifier = notifier
         self.runner_factory = runner_factory
         self.breakers_factory = breakers_factory
+        self.overseer = overseer
         self.ledger_path = Path(ledger_path)
         self.clock = clock
 
     # ------------------------------------------------------------------ #
     # Public
     # ------------------------------------------------------------------ #
-    def resume_waiting(self) -> list[tuple[str, str]]:
-        """Resume every WAITING run whose answer has arrived. Idempotent."""
+    def resume_waiting(
+        self, wave_run_ids: Optional[set[str]] = None
+    ) -> list[tuple[str, str]]:
+        """Resume every WAITING run whose answer has arrived. Idempotent.
+
+        ``wave_run_ids`` are the run ids belonging to the currently-open wave; a run
+        in that set is left for the overseer's ``supervise`` to triage on abort (it
+        owns the wave's abort -> {handoff | block} decision). Only NON-wave runs get
+        the legacy ``block_dev_issue_if_aborted`` here — blocking a wave run would
+        defeat a handoff even on attempt 1 (A3). When called standalone (the CLI
+        ``poll``), the current wave is discovered from the ledger.
+        """
+        if wave_run_ids is None:
+            wave = self._load_ledger().current_wave
+            wave_run_ids = set(wave.run_ids) if wave else set()
         out: list[tuple[str, str]] = []
         for record in self.store.list(status=RunStatus.WAITING):
             req = record.pending_request
@@ -111,9 +145,12 @@ class Scheduler:
             archive = getattr(self.notifier, "archive", None)
             if archive is not None:
                 archive(req.request_id)
-            co.block_dev_issue_if_aborted(
-                self.github, record=self.store.load(record.run_id), status=status
-            )
+            # A wave run that aborts (e.g. a verify-gate timeout) is NOT blocked here;
+            # supervise() decides handoff-vs-block for it later this tick.
+            if record.run_id not in wave_run_ids:
+                co.block_dev_issue_if_aborted(
+                    self.github, record=self.store.load(record.run_id), status=status
+                )
             out.append((record.run_id, status.value))
         return out
 
@@ -123,14 +160,29 @@ class Scheduler:
         ledger = self._load_ledger()
         self._roll_window(ledger, now, sc.spend_window)
 
-        resumed = self.resume_waiting()
+        # Pass the open wave's run ids so a wave run that aborts on resume is left for
+        # supervise() to hand off, not blocked here (A3).
+        wave_run_ids = (
+            set(ledger.current_wave.run_ids) if ledger.current_wave else set()
+        )
+        resumed = self.resume_waiting(wave_run_ids)
 
         started: list[tuple[str, str, str]] = []
         window_spend = self._window_spend(ledger)
         halted = window_spend >= sc.global_spend_ceiling_usd
         if not halted:
+            # Triage first so its refined sev:/effort: labels order THIS tick's dev_task
+            # selection (find_claimable), then start dev work, then the slower reviews.
+            started += self._start_triage(now, ledger)
             started += self._start_dev_tasks(now, ledger)
             started += self._start_arch_reviews(now, ledger)
+
+        # Supervise AFTER resume + start so the wave-completion check sees a drained
+        # queue: the overseer reconciles stranded leases, hands off aborted runs, and
+        # drafts the wave PR once everything is terminal and nothing is claimable.
+        ov = self.overseer.supervise(
+            ledger, active_run_ids={r.run_id for r in self._active_runs()}
+        )
 
         self._save_ledger(ledger)
         return TickReport(
@@ -138,6 +190,9 @@ class Scheduler:
             started=started,
             window_spend_usd=self._window_spend(ledger),
             halted_for_spend=halted,
+            reconciled=ov.reconciled,
+            handed_off=ov.handed_off,
+            wave_pr=ov.wave_pr,
         )
 
     # ------------------------------------------------------------------ #
@@ -188,16 +243,19 @@ class Scheduler:
             breakers = self.breakers_factory(project)
             # A single run can never exceed the budget remaining in this window.
             breakers.budget_ceiling_usd = min(breakers.budget_ceiling_usd, remaining)
+            # Join this start to the open wave (opening one if none is open), so the
+            # overseer can aggregate it when the wave drains.
+            wave_id = self.overseer.current_or_new_wave(ledger)
             runner = self.runner_factory("dev_task", project)
             record = runner.create_run(
                 project_id=project.id,
                 breakers=breakers,
-                data={"issue_number": number, "repo": project.repo},
+                data={"issue_number": number, "repo": project.repo, "wave_id": wave_id},
             )
+            self.overseer.register_run(ledger, wave_id, record.run_id)
             status = runner.run(record.run_id)
-            co.block_dev_issue_if_aborted(
-                self.github, record=self.store.load(record.run_id), status=status
-            )
+            # NB: an aborted/failed dev run is NOT blocked here — it is a wave run, so
+            # the overseer's supervise() (later this tick) decides handoff vs block.
             ledger.last_started[project.id] = now
             ledger.started_count[project.id] = ledger.started_count.get(project.id, 0) + 1
             ledger.window_run_ids.append(record.run_id)
@@ -222,6 +280,30 @@ class Scheduler:
             )
             status = runner.run(record.run_id)  # bounded; never suspends
             ledger.last_arch_review[project.id] = now
+            ledger.window_run_ids.append(record.run_id)
+            out.append((project.id, record.run_id, status.value))
+        return out
+
+    def _start_triage(self, now: float, ledger: SchedulerLedger) -> list[tuple[str, str, str]]:
+        """Run each project's bounded triage at its (typically low) cadence so its
+        refined sev:/effort: labels feed find_claimable. Mirrors _start_arch_reviews:
+        bounded, never suspends, off unless ``triage_cadence_seconds`` is set."""
+        out: list[tuple[str, str, str]] = []
+        for project in self.registry.list_owned(self.cfg.instance.instance_id):
+            cadence = project.scheduling.triage_cadence_seconds
+            if cadence is None:
+                continue
+            last = ledger.last_triage.get(project.id)  # None => never triaged => due now
+            if last is not None and now - last < cadence:
+                continue
+            if self._window_spend(ledger) >= self.cfg.scheduling.global_spend_ceiling_usd:
+                break
+            runner = self.runner_factory("triage", project)
+            record = runner.create_run(
+                project_id=project.id, breakers=self.breakers_factory(project)
+            )
+            status = runner.run(record.run_id)  # bounded; never suspends
+            ledger.last_triage[project.id] = now
             ledger.window_run_ids.append(record.run_id)
             out.append((project.id, record.run_id, status.value))
         return out

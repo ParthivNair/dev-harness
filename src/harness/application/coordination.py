@@ -20,6 +20,7 @@ is not).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -42,6 +43,26 @@ STATE_LABELS = frozenset(
     {QUEUED, IN_PROGRESS, NEEDS_VERIFICATION, PR_OPEN, BLOCKED, DONE}
 )
 OWNER_PREFIX = "harness:owner:"
+
+# A FOREIGN marker label (deliberately NOT in STATE_LABELS) so it rides through
+# state transitions like any human tag. Stamped when a stranded/aborted run is
+# requeued for a fresh attempt, so a continuation is visible on the board.
+HANDOFF = "harness:handoff"
+
+# Prioritization labels (foreign — set by the triage loop, read by find_claimable).
+# Severity is the primary ordering key; effort is the "prefer quicker wins" tiebreak.
+SEVERITY_SCORES: dict[str, int] = {"high": 3, "med": 2, "low": 1}
+EFFORT_ORDER: dict[str, int] = {"s": 0, "m": 1, "l": 2}
+SEV_PREFIX = "sev:"
+EFFORT_PREFIX = "effort:"
+
+# ``Depends on #12`` / ``Sequencing: #12, #13`` lines in an issue body declare a
+# dependency on another issue. An issue is not claimable while any such issue is
+# still OPEN (unmerged), so e.g. #18 -> #22 self-order without manual scheduling.
+_DEPENDS_RE = re.compile(
+    r"^\s*(?:depends on|sequencing)\b[:\s]*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+_ISSUE_REF_RE = re.compile(r"#(\d+)")
 
 
 def owner_label(instance_id: str) -> str:
@@ -97,6 +118,23 @@ def release(github: GitHubAdapter, *, repo: str, number: int) -> IssueRef:
     issue = github.get_issue(repo=repo, number=number)
     labels = _compute_labels(issue, to_state=QUEUED, owner=None)
     return github.set_labels(repo=repo, number=number, labels=labels)
+
+
+def handoff_issue(
+    github: GitHubAdapter, *, repo: str, number: int, note: str
+) -> IssueRef:
+    """Requeue a stranded/aborted issue for a FRESH continuation attempt.
+
+    Unlike :func:`release` (a plain yield), a handoff also stamps the foreign
+    ``HANDOFF`` label and posts ``note`` as a comment carrying the handoff packet
+    (what was attempted, why it ended, spend) so the next run continues the work
+    instead of restarting cold. The label rides through future transitions because
+    it is not a state label. Returns the requeued issue.
+    """
+    issue = release(github, repo=repo, number=number)
+    issue = github.add_labels(repo=repo, number=number, labels=[HANDOFF])
+    github.comment_on_issue(repo=repo, number=number, body=note)
+    return issue
 
 
 def owns_issue(github: GitHubAdapter, *, repo: str, number: int, instance_id: str) -> bool:
@@ -168,16 +206,71 @@ def block_dev_issue_if_aborted(
         return False
 
 
+def _label_value(issue: IssueRef, prefix: str) -> Optional[str]:
+    """The suffix of the first ``<prefix><value>`` label on the issue, or None."""
+    for label in issue.labels:
+        if label.startswith(prefix):
+            return label[len(prefix):]
+    return None
+
+
+def severity_score(issue: IssueRef) -> int:
+    """Triage severity as a sortable score (high=3 / med=2 / low=1). Unlabelled
+    issues score 0 so they sort *below* any labelled issue but among themselves keep
+    plain number order (the regression-safe fallback)."""
+    return SEVERITY_SCORES.get(_label_value(issue, SEV_PREFIX) or "", 0)
+
+
+def effort_rank(issue: IssueRef) -> int:
+    """Triage effort as a sortable rank (s=0 < m=1 < l=2); unlabelled sorts last so a
+    quicker, sized task is preferred over an unsized one at equal severity."""
+    return EFFORT_ORDER.get(_label_value(issue, EFFORT_PREFIX) or "", len(EFFORT_ORDER))
+
+
+def depends_on(issue: IssueRef) -> list[int]:
+    """Issue numbers this issue's body declares it ``Depends on`` / ``Sequencing`` to.
+
+    Parses lines like ``Depends on #12`` or ``Sequencing: #12, #13``; deterministic
+    and tolerant (no match => no dependencies). Pure — it reads only the body text.
+    """
+    out: list[int] = []
+    for line in _DEPENDS_RE.findall(issue.body or ""):
+        out += [int(n) for n in _ISSUE_REF_RE.findall(line)]
+    return list(dict.fromkeys(out))  # dedupe, preserve order
+
+
 def find_claimable(
     github: GitHubAdapter, *, repo: str, instance_id: str
 ) -> Optional[int]:
-    """Lowest-numbered open ``queued`` issue not already owned by another instance.
+    """The highest-priority READY open ``queued`` issue claimable by this instance.
 
-    Uses the live REST list (never the Search API). Returns the issue number to
-    pass to :func:`claim`, or None if there is no available work.
+    Replaces a plain ``min(number)`` with dependency-aware, severity-ordered
+    selection (Phase 2 §2a):
+
+    * **Dependency gate.** An issue whose body declares ``Depends on #N`` /
+      ``Sequencing`` to an issue still OPEN (unmerged) is NOT ready — it is dropped
+      this pass and released once its dependency closes. So #18 -> #22 self-order.
+    * **Priority.** Among ready candidates, sort by severity score desc, then lower
+      effort (quicker wins), then lower number. With NO sev/effort labels this is
+      pure number order (regression-safe — nothing changes for an untriaged queue).
+
+    Pure/deterministic over the live REST list (never the Search API). Returns the
+    issue number to pass to :func:`claim`, or None if there is no ready work.
     """
     issues = github.list_issues(repo=repo, state="open", labels=[QUEUED])
     candidates = [i for i in issues if owner_of(i) in (None, instance_id)]
     if not candidates:
         return None
-    return min(i.number for i in candidates)
+
+    # The set of issue numbers still open in this repo — a dependency on any of them
+    # gates the dependent issue. One live read covers every candidate's deps.
+    open_numbers = {i.number for i in github.list_issues(repo=repo, state="open")}
+    ready = [
+        i for i in candidates if not any(dep in open_numbers for dep in depends_on(i))
+    ]
+    if not ready:
+        return None
+
+    # severity desc, effort asc, number asc — deterministic and total.
+    ready.sort(key=lambda i: (-severity_score(i), effort_rank(i), i.number))
+    return ready[0].number

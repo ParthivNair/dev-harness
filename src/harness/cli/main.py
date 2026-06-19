@@ -41,9 +41,16 @@ def _echo_tick(report: TickReport) -> None:
         typer.echo(f"resumed {rid} -> {status}")
     for pid, rid, status in report.started:
         typer.echo(f"started {pid} {rid} -> {status}")
+    for number in report.reconciled:
+        typer.echo(f"reconciled #{number} (stranded lease requeued)")
+    for number, reason in report.handed_off:
+        typer.echo(f"handed off #{number} ({reason})")
+    if report.wave_pr:
+        typer.echo(f"wave PR: {report.wave_pr}")
     note = "  (HALTED: spend ceiling reached)" if report.halted_for_spend else ""
     typer.echo(f"window spend: ${report.window_spend_usd:.2f}{note}")
-    if not report.resumed and not report.started:
+    if not report.resumed and not report.started and not report.reconciled \
+            and not report.handed_off and not report.wave_pr:
         typer.echo("nothing to do")
 
 

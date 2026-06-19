@@ -30,6 +30,8 @@ class FileNotifier:
         self.done_dir = self.inbox / "done"
         self.inbox.mkdir(parents=True, exist_ok=True)
         self.log_path = Path(log_path).expanduser() if log_path else None
+        #: Captured overseer advisories, in order — handy for assertions in tests.
+        self.warnings: list[str] = []
 
     def _request_path(self, request_id: str) -> Path:
         return self.inbox / f"{request_id}.request.json"
@@ -46,6 +48,13 @@ class FileNotifier:
             )
             with open(self.log_path, "a", encoding="utf-8") as handle:
                 handle.write(line)
+
+    def warn(self, message: str) -> None:
+        """Capture an autonomous-path advisory (and append it to the log if any)."""
+        self.warnings.append(message)
+        if self.log_path is not None:
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"{utcnow_iso()} WARN :: {message}\n")
 
     def collect(self, request: VerificationRequest) -> Optional[VerificationResponse]:
         path = self._response_path(request.request_id)

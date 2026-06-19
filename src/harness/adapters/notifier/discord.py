@@ -178,6 +178,10 @@ class DiscordNotifier:
         except (urllib.error.URLError, OSError, ValueError):
             pass  # gate stays answerable via CLI / file inbox
 
+    def warn(self, message: str) -> None:
+        # Durable capture via the inner file notifier; a chat surface is optional.
+        self._file.warn(message)
+
     # collect / write_response / archive are the durable substrate, unchanged.
     def collect(self, request: VerificationRequest) -> Optional[VerificationResponse]:
         return self._file.collect(request)

@@ -20,12 +20,14 @@ cwd = "."
 root = ".harness/prompts"
 dev_task = ".harness/prompts/dev_task.md"
 arch_review = ".harness/prompts/arch_review.md"
+triage = ".harness/prompts/triage.md"
 
 [scheduling]
 priority = "normal"
 min_poll_interval_seconds = 1800       # at most every 30 min
 loops = ["dev_task"]
 arch_review_cadence_seconds = 86400    # review itself ~daily, files its own tickets
+triage_cadence_seconds = 3600          # groom the backlog hourly: refine sev:/effort: labels
 
 [claude]
 model = "claude-opus-4-8"
@@ -33,3 +35,14 @@ permission_mode = "acceptEdits"
 # Belt-and-suspenders alongside the structural guard: the loop never commits/pushes;
 # it edits the working tree and the harness opens the draft PR via the GitHub API.
 disallowed_tools = ["Bash(git push:*)", "Bash(git commit:*)"]
+
+# This repo is SELF-MANAGED: it is reviewed at the (wave) PR by a separate agent
+# session, not via a mid-run human gate. So it opts the two normally-gated actions
+# into autonomous — overriding ONLY for this project; the instance defaults in
+# harness.toml stay safe (gated) for human-reviewed repos like the DAW.
+#   verify_gate   -> skip the mid-run "perceive the result" gate; flow to publish.
+#   mark_pr_ready -> the overseer promotes the aggregated wave PR draft -> ready.
+# The harness STILL cannot merge; promotion to ready is the most it does.
+[overrides.autonomy]
+verify_gate = "autonomous"
+mark_pr_ready = "autonomous"

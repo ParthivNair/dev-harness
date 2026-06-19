@@ -47,10 +47,13 @@ def test_answer_run_approves_to_completion(tmp_path: Path) -> None:
     status = operations.answer_run(c, run_id=run_id, approved=True, notes="looks good")
     assert status is RunStatus.COMPLETED
     final = c.store.load(run_id)
-    assert final.data["pr_url"]
+    # B1: the loop publishes the branch but opens NO per-issue PR (the overseer
+    # aggregates published branches into one wave PR), so the issue is "published"
+    # (PR_OPEN) and there is no draft PR from the loop.
+    assert final.data.get("published") is True
+    assert final.data.get("pr_url") is None
     assert co.state_of(gh.get_issue(repo=REPO, number=number)) == co.PR_OPEN
-    pulls = gh.list_pulls(repo=REPO)
-    assert len(pulls) == 1 and pulls[0].draft is True
+    assert gh.list_pulls(repo=REPO) == []
 
 
 def test_answer_run_reject_loops_back_to_waiting(tmp_path: Path) -> None:

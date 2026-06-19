@@ -80,14 +80,22 @@ class GitHubAdapter(Protocol):
 
     def assign_issue(self, *, repo: str, number: int, assignee: str) -> IssueRef: ...
 
+    def comment_on_issue(self, *, repo: str, number: int, body: str) -> None:
+        """Post a comment on an issue (visibility + the cross-machine handoff trail)."""
+
     def open_draft_pr(
         self, *, repo: str, head: str, base: str, title: str, body: str
     ) -> PullRef:
         """Open a PR. ALWAYS a draft — implementations hard-wire ``draft=True``."""
 
-    # ---- GATED WRITE (autonomy tier: gated) — must pass the ActionGuard ----
+    # ---- GATED WRITE (autonomy tier: gated by default) — must pass the ActionGuard ----
     def mark_pr_ready(self, *, repo: str, number: int) -> PullRef:
-        """Draft -> ready-for-review (GraphQL under the hood). Crosses into human
-        territory, so the engine routes it through the gate, never autonomously."""
+        """Draft -> ready-for-review (GraphQL under the hood).
+
+        Gated by DEFAULT: for a human-reviewed repo this crosses into human territory,
+        so the engine routes it through a gate. A SELF-MANAGED project may override
+        ``mark_pr_ready`` to autonomous in its ``[overrides.autonomy]`` so the overseer
+        promotes its aggregated wave PR to ready for a reviewing agent to pick up. Even
+        then the merge is still external — there is deliberately no ``merge_pr`` here."""
 
     # NOTE: deliberately NO merge_pr / push / force_push / update_ref(main).
