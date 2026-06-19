@@ -54,7 +54,7 @@ TAXONOMY = {
 class ApproveExecutor(EchoExecutor):
     """Echo executor whose Claude call returns an approving PR-review verdict."""
 
-    def run_claude_task(self, *, project, prompt, json_schema=None) -> ClaudeResult:
+    def run_claude_task(self, *, project, prompt, json_schema=None, worktree=None) -> ClaudeResult:
         import json as _json
 
         return ClaudeResult(
@@ -75,7 +75,7 @@ class AlwaysFailsTestExecutor(EchoExecutor):
     """EchoExecutor whose tests never pass, so a dev_task run loops to its
     max-iterations abort — used to exercise the overseer's handoff across a tick."""
 
-    def run_test(self, *, project: ProjectConfig) -> CommandResult:
+    def run_test(self, *, project: ProjectConfig, worktree=None) -> CommandResult:
         return CommandResult(1, "1 failed", "assertion error", 0.01)
 
 
@@ -336,7 +336,7 @@ class TriageJudgementExecutor(EchoExecutor):
         super().__init__()
         self._judgements = judgements
 
-    def run_claude_task(self, *, project, prompt, json_schema=None):  # type: ignore[no-untyped-def]
+    def run_claude_task(self, *, project, prompt, json_schema=None, worktree=None):  # type: ignore[no-untyped-def]
         import json
 
         # Only the triage call carries the triage schema; everything else is echo.
@@ -345,7 +345,9 @@ class TriageJudgementExecutor(EchoExecutor):
                 result_text=json.dumps({"judgements": self._judgements}),
                 session_id="triage", total_cost_usd=0.01,
             )
-        return super().run_claude_task(project=project, prompt=prompt, json_schema=json_schema)
+        return super().run_claude_task(
+            project=project, prompt=prompt, json_schema=json_schema, worktree=worktree
+        )
 
 
 def test_c1_scheduler_deploys_highest_priority_ready_issue_first(tmp_path: Path) -> None:

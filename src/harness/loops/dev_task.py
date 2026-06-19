@@ -1,11 +1,14 @@
 """The real dev/test loop — the harness's "junior dev".
 
-    claim_issue -> generate -> build -> test -> verify_gate -> publish -> finish
+    claim_issue -> prepare_branch -> generate -> build -> test -> verify_gate -> publish -> finish
 
 It pulls a ``harness:queued`` issue (claimed via the lease in
-:mod:`harness.application.coordination`), runs Claude on the project's
-``dev_task`` prompt, builds and tests (looping back with the failure log as
-context on any failure), optionally gates the human to *perceive* the result,
+:mod:`harness.application.coordination`), cuts a fresh feature branch from
+``origin/main`` in an isolated worktree (``prepare_branch``, so each run's PR
+diffs only its own change instead of stacking on a prior run's tip), runs Claude
+on the project's ``dev_task`` prompt in that worktree, builds and tests (looping
+back with the failure log as context on any failure), optionally gates the human
+to *perceive* the result,
 then **publishes the feature branch**. The loop opens NO PR of its own — a
 COMPLETED dev_task run means "branch published, ready to aggregate". The single
 aggregated wave PR is the overseer's job (see :mod:`harness.application.overseer`).
@@ -137,12 +140,34 @@ def build_dev_loop(
         if co.owns_issue(github, repo=repo, number=number, instance_id=instance_id):
             # already ours (scheduler pre-claimed, or a loop-back): re-assert in-progress
             co.transition(github, repo=repo, number=number, to_state=co.IN_PROGRESS)
-            return StepOutcome(next_step="generate")
+            return StepOutcome(next_step="prepare_branch")
         result = co.claim(github, repo=repo, number=number, instance_id=instance_id)
         if not result.ok:
             # lost the lease / owned elsewhere -> finish as a clean no-op (no spend)
             return StepOutcome(next_step=None, output={"claim_lost": True, "reason": result.reason})
-        return StepOutcome(next_step="generate", output={"claimed": number})
+        return StepOutcome(next_step="prepare_branch", output={"claimed": number})
+
+    def prepare_branch(ctx: RunContext) -> StepOutcome:
+        # Establish a clean, trunk-rooted base BEFORE any editing: cut the feature
+        # branch from origin/main in an isolated worktree so this run's PR diffs only
+        # its own change (no stacking on a prior run's tip, no leak of dirty local
+        # state). Done ONCE per issue — a build/test loop-back keeps editing the same
+        # prepared worktree (its accumulated work + the failure log), so we skip
+        # re-cutting when the worktree is already recorded.
+        _, number = _repo_and_number(ctx)
+        if ctx.data.get("worktree"):
+            return StepOutcome(next_step="generate")
+        branch = f"harness/{instance_id}/issue-{number}"
+        worktree = executor.prepare_branch(project=project, branch=branch)
+        return StepOutcome(
+            next_step="generate",
+            state_patch={"branch": branch, "worktree": str(worktree)},
+            output={"branch": branch, "worktree": str(worktree)},
+        )
+
+    def _worktree(ctx: RunContext) -> Optional[Path]:
+        wt = ctx.data.get("worktree")
+        return Path(wt) if wt else None
 
     def generate(ctx: RunContext) -> StepOutcome:
         repo, number = _repo_and_number(ctx)
@@ -151,12 +176,13 @@ def build_dev_loop(
         prompt = _compose_prompt(
             base_prompt, issue.title, issue.body, ctx.data.get("last_failure"), handoff
         )
-        result = executor.run_claude_task(project=project, prompt=prompt)
+        result = executor.run_claude_task(
+            project=project, prompt=prompt, worktree=_worktree(ctx)
+        )
         ctx.record_cost(result.total_cost_usd, result.input_tokens, result.output_tokens)
         return StepOutcome(
             next_step="build",
             state_patch={
-                "branch": f"harness/{instance_id}/issue-{number}",
                 "issue_title": issue.title,
                 "session_id": result.session_id,
                 "claude_result": result.result_text,
@@ -165,7 +191,7 @@ def build_dev_loop(
         )
 
     def build(ctx: RunContext) -> StepOutcome:
-        result = executor.run_build(project=project)
+        result = executor.run_build(project=project, worktree=_worktree(ctx))
         if result.ok:
             return StepOutcome(
                 next_step="test",
@@ -181,7 +207,7 @@ def build_dev_loop(
         )
 
     def test(ctx: RunContext) -> StepOutcome:
-        result = executor.run_test(project=project)
+        result = executor.run_test(project=project, worktree=_worktree(ctx))
         if not result.ok:
             return StepOutcome(
                 next_step="claim_issue",
@@ -253,7 +279,10 @@ def build_dev_loop(
         branch = ctx.data.get("branch", f"harness/{instance_id}/issue-{number}")
         title = ctx.data.get("issue_title") or f"issue #{number}"
         result = executor.publish_branch(
-            project=project, branch=branch, commit_message=f"harness: {title} (#{number})"
+            project=project,
+            branch=branch,
+            commit_message=f"harness: {title} (#{number})",
+            worktree=_worktree(ctx),
         )
         co.transition(github, repo=repo, number=number, to_state=co.PR_OPEN)
         return StepOutcome(
@@ -274,6 +303,7 @@ def build_dev_loop(
         start_step="claim_issue",
         steps={
             "claim_issue": claim_issue,
+            "prepare_branch": prepare_branch,
             "generate": generate,
             "build": build,
             "test": test,
