@@ -42,17 +42,55 @@ class ScriptedExecutor(EchoExecutor):
         self._fail_tests = fail_tests
         self._fail_builds = fail_builds
 
-    def run_build(self, *, project: ProjectConfig) -> CommandResult:
+    def run_build(self, *, project: ProjectConfig, worktree=None) -> CommandResult:
         if self._fail_builds > 0:
             self._fail_builds -= 1
             return CommandResult(1, "", "build broke", 0.01)
-        return super().run_build(project=project)
+        return super().run_build(project=project, worktree=worktree)
 
-    def run_test(self, *, project: ProjectConfig) -> CommandResult:
+    def run_test(self, *, project: ProjectConfig, worktree=None) -> CommandResult:
         if self._fail_tests > 0:
             self._fail_tests -= 1
             return CommandResult(1, "1 failed", "assertion error", 0.01)
-        return super().run_test(project=project)
+        return super().run_test(project=project, worktree=worktree)
+
+
+class WorktreeRecordingExecutor(ScriptedExecutor):
+    """Records prepare_branch calls and the ``worktree`` threaded into each step, so
+    the loop's clean-base wiring (branch cut once from origin/main, then edited/built/
+    published in that worktree) can be asserted without real git."""
+
+    def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(**kwargs)
+        self.prepared: list[str] = []
+        self.claude_worktrees: list = []
+        self.build_worktrees: list = []
+        self.test_worktrees: list = []
+        self.publish_worktree = None
+
+    def prepare_branch(self, *, project, branch):  # type: ignore[no-untyped-def]
+        self.prepared.append(branch)
+        return super().prepare_branch(project=project, branch=branch)
+
+    def run_claude_task(self, *, project, prompt, json_schema=None, worktree=None):  # type: ignore[no-untyped-def]
+        self.claude_worktrees.append(worktree)
+        return super().run_claude_task(
+            project=project, prompt=prompt, json_schema=json_schema, worktree=worktree
+        )
+
+    def run_build(self, *, project, worktree=None):  # type: ignore[no-untyped-def]
+        self.build_worktrees.append(worktree)
+        return super().run_build(project=project, worktree=worktree)
+
+    def run_test(self, *, project, worktree=None):  # type: ignore[no-untyped-def]
+        self.test_worktrees.append(worktree)
+        return super().run_test(project=project, worktree=worktree)
+
+    def publish_branch(self, *, project, branch, commit_message, worktree=None):  # type: ignore[no-untyped-def]
+        self.publish_worktree = worktree
+        return super().publish_branch(
+            project=project, branch=branch, commit_message=commit_message, worktree=worktree
+        )
 
 
 def _seed_queued_issue(gh: InMemoryGitHub, *, title: str = "Add feature", body: str = "do X") -> int:
@@ -117,6 +155,61 @@ def test_happy_path_claims_builds_gates_then_publishes_no_pr(tmp_path: Path) -> 
     assert "open_pr#1" not in final.step_log         # the open_pr step is gone
     assert gh.list_pulls(repo=REPO) == []            # the loop opened no PR
     assert co.state_of(gh.get_issue(repo=REPO, number=number)) == co.PR_OPEN  # "published"
+
+
+def test_prepare_branch_cuts_clean_base_then_threads_worktree_through(tmp_path: Path) -> None:
+    # The fix: a prepare_branch step cuts the feature branch from origin/main in an
+    # isolated worktree BEFORE generate, and that worktree is threaded into the
+    # claude/build/test/publish calls so the run never edits the live checkout.
+    gh = InMemoryGitHub()
+    number = _seed_queued_issue(gh)
+    root = tmp_path / "state"
+    executor = WorktreeRecordingExecutor()
+    taxonomy = {**TAXONOMY, "verify_gate": AutonomyTier.AUTONOMOUS}  # run straight through
+    store, runner = _runner(root, gh, RecordingNotifier(), executor, tmp=tmp_path, taxonomy=taxonomy)
+    run_id = runner.create_run(
+        project_id="sample", breakers=BreakerState(max_iterations=5),
+        data={"issue_number": number, "repo": REPO},
+    ).run_id
+
+    assert runner.run(run_id) is RunStatus.COMPLETED
+    final = store.load(run_id)
+
+    # The branch was prepared exactly once, before generate, and recorded in state.
+    assert executor.prepared == [f"harness/{INSTANCE}/issue-{number}"]
+    assert "prepare_branch#1" in final.step_log
+    wt = final.data["worktree"]
+    assert wt and final.data["branch"] == f"harness/{INSTANCE}/issue-{number}"
+    # Every editing/verifying/publishing step ran in that prepared worktree.
+    assert [str(w) for w in executor.claude_worktrees] == [wt]
+    assert [str(w) for w in executor.build_worktrees] == [wt]
+    assert [str(w) for w in executor.test_worktrees] == [wt]
+    assert str(executor.publish_worktree) == wt
+
+
+def test_loop_back_does_not_recut_the_branch(tmp_path: Path) -> None:
+    # A build/test failure loops back to keep editing the SAME prepared worktree (its
+    # accumulated work + the failure log); the branch must not be re-cut from
+    # origin/main on the second iteration, or partial progress would be wiped.
+    gh = InMemoryGitHub()
+    number = _seed_queued_issue(gh)
+    root = tmp_path / "state"
+    executor = WorktreeRecordingExecutor(fail_tests=1)  # iter 1 fails, iter 2 passes
+    taxonomy = {**TAXONOMY, "verify_gate": AutonomyTier.AUTONOMOUS}
+    store, runner = _runner(root, gh, RecordingNotifier(), executor, tmp=tmp_path, taxonomy=taxonomy)
+    run_id = runner.create_run(
+        project_id="sample", breakers=BreakerState(max_iterations=5),
+        data={"issue_number": number, "repo": REPO},
+    ).run_id
+
+    assert runner.run(run_id) is RunStatus.COMPLETED
+    rec = store.load(run_id)
+    assert rec.breakers.loop_count == 2          # it did loop back
+    assert executor.prepared == [f"harness/{INSTANCE}/issue-{number}"]  # cut ONCE only
+    # The step re-runs on the loop-back, but short-circuits (no new branch in output)
+    # because the worktree is already prepared — so accumulated work isn't wiped.
+    assert "prepare_branch#2" in rec.step_log
+    assert rec.step_log["prepare_branch#2"].output is None
 
 
 def test_reject_loops_back_then_approve_completes(tmp_path: Path) -> None:
@@ -253,9 +346,11 @@ class PromptCapturingExecutor(EchoExecutor):
         super().__init__()
         self.prompts: list[str] = []
 
-    def run_claude_task(self, *, project, prompt, json_schema=None):  # type: ignore[no-untyped-def]
+    def run_claude_task(self, *, project, prompt, json_schema=None, worktree=None):  # type: ignore[no-untyped-def]
         self.prompts.append(prompt)
-        return super().run_claude_task(project=project, prompt=prompt, json_schema=json_schema)
+        return super().run_claude_task(
+            project=project, prompt=prompt, json_schema=json_schema, worktree=worktree
+        )
 
 
 def test_generate_injects_prior_attempt_context_when_a_prior_terminal_run_exists(

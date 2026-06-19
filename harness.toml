@@ -43,7 +43,7 @@ force_push = "forbidden"
 
 [circuit_breakers]
 max_iterations = 5
-spend_ceiling_usd = 5.0
+spend_ceiling_usd = 25.0       # per-run cap — one opus generate runs ~$7-15; leave room for build/test retries
 spend_is_hard_stop = true
 
 # The scheduler (drives `harness tick` / `harness watch`). Off by default; the
@@ -52,7 +52,7 @@ spend_is_hard_stop = true
 enabled = false
 tick_interval_seconds = 300
 max_concurrent_runs = 2
-global_spend_ceiling_usd = 20.0
+global_spend_ceiling_usd = 100.0     # shared daily cap across all runs (opus is ~$7-15/issue)
 spend_window = "daily"
 
 # --- Registered projects: pointers to per-repo configs ---

@@ -64,30 +64,74 @@ class SubprocessExecutor:
             duration_s=time.monotonic() - start,
         )
 
-    def _cwd(self, project: ProjectConfig) -> Path:
-        return self._root_of(project.id) / project.commands.cwd
+    def _cwd(self, project: ProjectConfig, worktree: Optional[Path] = None) -> Path:
+        # An isolated run operates in its prepared worktree; otherwise the project root.
+        root = Path(worktree) if worktree is not None else self._root_of(project.id)
+        return root / project.commands.cwd
 
-    def run_build(self, *, project: ProjectConfig) -> CommandResult:
-        return self._run(self._as_argv(project.commands.build), self._cwd(project))
+    @staticmethod
+    def _worktree_path(project: ProjectConfig, branch: str) -> Path:
+        """A stable on-disk location for a run's isolated worktree. Stable (not a
+        random temp dir) so a run suspended at the verify gate can resume in a fresh
+        process and still find the worktree it prepared."""
+        safe = branch.replace("/", "-").replace("\\", "-")
+        return Path(tempfile.gettempdir()) / "harness-worktrees" / project.id / safe
 
-    def run_test(self, *, project: ProjectConfig) -> CommandResult:
-        return self._run(self._as_argv(project.commands.test), self._cwd(project))
+    def prepare_branch(self, *, project: ProjectConfig, branch: str) -> Path:
+        # Same push guard: refuse trunks / ambiguous names before touching git.
+        self._guard_feature_branch(branch)
+        repo_root = self._root_of(project.id)
+        self._git(["fetch", "origin"], repo_root)
+        wt = self._worktree_path(project, branch)
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        # Idempotent: clear any stale worktree/branch from a crashed prior attempt so a
+        # re-run (or at-least-once step retry) doesn't wedge on "already exists" (A6).
+        self._run(["git", "worktree", "remove", "--force", str(wt)], repo_root)
+        self._run(["git", "branch", "-D", branch], repo_root)
+        # Cut the feature branch from the TRUNK as published, in an isolated worktree —
+        # never the human's live checkout, so dirty/concurrent local state cannot leak
+        # in and successive runs are not stacked on each other's tips.
+        self._git(["worktree", "add", "-B", branch, str(wt), "origin/main"], repo_root)
+        return wt
+
+    def run_build(
+        self, *, project: ProjectConfig, worktree: Optional[Path] = None
+    ) -> CommandResult:
+        return self._run(self._as_argv(project.commands.build), self._cwd(project, worktree))
+
+    def run_test(
+        self, *, project: ProjectConfig, worktree: Optional[Path] = None
+    ) -> CommandResult:
+        return self._run(self._as_argv(project.commands.test), self._cwd(project, worktree))
 
     def publish_branch(
-        self, *, project: ProjectConfig, branch: str, commit_message: str
+        self,
+        *,
+        project: ProjectConfig,
+        branch: str,
+        commit_message: str,
+        worktree: Optional[Path] = None,
     ) -> CommandResult:
         self._guard_feature_branch(branch)
-        cwd = self._cwd(project)
-        # Create/reset the feature branch at HEAD (working-tree edits are preserved),
-        # commit everything, and push WITHOUT --force. A human still merges.
-        self._git(["checkout", "-B", branch], cwd)
+        cwd = Path(worktree) if worktree is not None else self._cwd(project)
+        # The branch was already cut from origin/main by prepare_branch and is checked
+        # out HERE; we only commit the run's edits and push. The worktree began clean,
+        # so `add -A` stages exactly this run's changes (no blanket HEAD checkout, no
+        # leak of unrelated working-tree dirt). Push WITHOUT --force; a human merges.
         self._git(["add", "-A"], cwd)
         commit = self._run(["git", "commit", "-m", commit_message], cwd)
         if not commit.ok and "nothing to commit" in (commit.stdout + commit.stderr).lower():
             raise ExecutorError("nothing to publish: the task produced no file changes")
         if not commit.ok:
             raise ExecutorError(f"git commit failed ({commit.exit_code}): {commit.stderr[:300]}")
-        return self._git(["push", "-u", "origin", branch], cwd)
+        pushed = self._git(["push", "-u", "origin", branch], cwd)
+        if worktree is not None:
+            # The branch now lives on origin; detach the temp worktree and drop the
+            # local ref so it can't wedge the next run (mirrors assemble_wave_branch).
+            repo_root = self._root_of(project.id)
+            self._run(["git", "worktree", "remove", "--force", str(worktree)], repo_root)
+            self._run(["git", "branch", "-D", branch], repo_root)
+        return pushed
 
     def assemble_wave_branch(
         self,
@@ -183,6 +227,7 @@ class SubprocessExecutor:
         project: ProjectConfig,
         prompt: str,
         json_schema: Optional[dict[str, Any]] = None,
+        worktree: Optional[Path] = None,
     ) -> ClaudeResult:
         c = project.claude
         argv = [
@@ -205,7 +250,8 @@ class SubprocessExecutor:
         if json_schema is not None:
             argv += ["--json-schema", json.dumps(json_schema)]
 
-        result = self._run(argv, self._root_of(project.id))
+        cwd = Path(worktree) if worktree is not None else self._root_of(project.id)
+        result = self._run(argv, cwd)
         if not result.ok:
             raise ExecutorError(
                 f"claude exited {result.exit_code}: {result.stderr[:500]}"

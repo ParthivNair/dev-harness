@@ -8,6 +8,7 @@ result dataclasses; it never branches on the OS.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
 # Avoid a hard import cycle at type-check time; ProjectConfig is only used for typing.
@@ -52,24 +53,49 @@ class ClaudeResult:
 
 @runtime_checkable
 class Executor(Protocol):
+    def prepare_branch(self, *, project: ProjectConfig, branch: str) -> Path:
+        """Establish a clean, trunk-rooted base for a run BEFORE any editing.
+
+        Fetch ``origin`` and create ``branch`` from ``origin/main`` inside a fresh,
+        ISOLATED ``git worktree`` (never the human's live checkout), so dirty or
+        concurrent local state cannot leak into the branch and successive runs are
+        not stacked on each other's tips. Returns the worktree path; the run's
+        ``run_claude_task``/``run_build``/``run_test``/``publish_branch`` calls then
+        operate in that worktree. Same guard as the push paths: a namespaced feature
+        branch ONLY, never a trunk."""
+
     def run_claude_task(
         self,
         *,
         project: ProjectConfig,
         prompt: str,
         json_schema: Optional[dict[str, Any]] = None,
+        worktree: Optional[Path] = None,
     ) -> ClaudeResult:
-        """Invoke Claude Code non-interactively; return its result + cost."""
+        """Invoke Claude Code non-interactively; return its result + cost. When
+        ``worktree`` is given the agent edits there (the prepared feature branch)
+        instead of the project root."""
 
-    def run_build(self, *, project: ProjectConfig) -> CommandResult: ...
+    def run_build(
+        self, *, project: ProjectConfig, worktree: Optional[Path] = None
+    ) -> CommandResult: ...
 
-    def run_test(self, *, project: ProjectConfig) -> CommandResult: ...
+    def run_test(
+        self, *, project: ProjectConfig, worktree: Optional[Path] = None
+    ) -> CommandResult: ...
 
     def publish_branch(
-        self, *, project: ProjectConfig, branch: str, commit_message: str
+        self,
+        *,
+        project: ProjectConfig,
+        branch: str,
+        commit_message: str,
+        worktree: Optional[Path] = None,
     ) -> CommandResult:
-        """Commit the working tree and push it to a FEATURE branch so a draft PR can
-        reference it. The autonomous path needs this, but it is deliberately narrow:
+        """Commit the run's edits and push the ALREADY-PREPARED ``branch`` so a draft
+        PR can reference it. ``branch`` must have been created by
+        :meth:`prepare_branch` (from ``origin/main`` in ``worktree``); this method no
+        longer cuts the branch from an arbitrary HEAD. It is deliberately narrow:
         implementations MUST refuse ``main``/``master`` and MUST NOT force-push. The
         GitHubAdapter still has no merge/push — only this guarded feature-branch push
         exists, and a human still merges."""

@@ -8,6 +8,7 @@ is a one-line change in the composition root.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from harness.config.models import ProjectConfig
@@ -19,14 +20,28 @@ class EchoExecutor:
         self._calls = 0
         self._claude_cost_usd = claude_cost_usd
 
-    def run_build(self, *, project: ProjectConfig) -> CommandResult:
+    def prepare_branch(self, *, project: ProjectConfig, branch: str) -> Path:
+        # No git: hand back a deterministic stand-in worktree path. Build/test/publish
+        # ignore it, but the loop still threads it through exactly as in production.
+        return Path(f"/echo-worktree/{project.id}/{branch.replace('/', '-')}")
+
+    def run_build(
+        self, *, project: ProjectConfig, worktree: Optional[Path] = None
+    ) -> CommandResult:
         return CommandResult(0, f"[echo] build {project.id} OK", "", 0.01)
 
-    def run_test(self, *, project: ProjectConfig) -> CommandResult:
+    def run_test(
+        self, *, project: ProjectConfig, worktree: Optional[Path] = None
+    ) -> CommandResult:
         return CommandResult(0, f"[echo] tests {project.id} passed", "", 0.01)
 
     def publish_branch(
-        self, *, project: ProjectConfig, branch: str, commit_message: str
+        self,
+        *,
+        project: ProjectConfig,
+        branch: str,
+        commit_message: str,
+        worktree: Optional[Path] = None,
     ) -> CommandResult:
         return CommandResult(0, f"[echo] published {branch}", "", 0.01)
 
@@ -52,6 +67,7 @@ class EchoExecutor:
         project: ProjectConfig,
         prompt: str,
         json_schema: Optional[dict[str, Any]] = None,
+        worktree: Optional[Path] = None,
     ) -> ClaudeResult:
         self._calls += 1
         return ClaudeResult(
