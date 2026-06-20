@@ -19,9 +19,20 @@ platform = "windows"                 # windows | macos | linux — informational
 
 [github]
 account = "your-github-username"
-repo = "your-github-username/dev-harness-coordination"  # the coordination repo (issues/PRs)
+repo = "your-github-username/coordination-repo"  # the coordination repo (issues/PRs)
 api_base = "https://api.github.com"
 use_in_memory_fake = false           # set true to run offline with the in-memory GitHub fake
+
+# Selects the code-gen executor INDEPENDENTLY of the GitHub adapter above.
+#   auto  (default) — executor follows use_in_memory_fake (fake => echo, real => Claude)
+#   real            — force the real Claude subprocess executor
+#   echo            — force the echo stub (e.g. real GitHub + echo, for a no-spend smoke)
+# Decoupling lets you do a "dry run": real Claude (real) + fake GitHub
+# (use_in_memory_fake=true) spends tokens but makes no GitHub *coordination* API
+# writes (issues/labels/PRs). Note: a dev_task run can still `git push` its feature
+# branch to origin — only the GitHub API is faked, not git itself.
+[execution]
+mode = "auto"
 
 [state_store]
 backend = "json"
@@ -89,14 +100,23 @@ open_browser = true
 board_ttl_seconds = 20               # cache for GitHub-derived board reads
 
 # Register each managed project as a pointer to where its repo sits on THIS disk.
-# The project's own config (owner, build/test commands, prompts) lives in that repo.
+# The project's own config (owner, build/test commands, prompts, [project].goals)
+# lives in that repo's harness.project.toml.
+#
+# You usually DON'T hand-write these blocks. Instead, onboard a repo with:
+#     harness add-project ../some-repo --repo owner/some-repo [--id some-repo] [--autonomous]
+# which detects the repo's build/test commands, scaffolds its harness.project.toml,
+# and appends the pointer below for you. Then provision its coordination labels and
+# generate a starter backlog:
+#     harness labels-init some-repo
+#     harness research some-repo --goals goals.txt   # files harness:queued issues
+#
+# Other useful verbs:
+#     harness doctor                    # preflight: real adapters + token + claude CLI
+#     harness install-schedule --apply  # register `harness tick` with the OS scheduler
+#
+# Example pointer (path is relative to THIS file's directory, or absolute):
 [[projects]]
-id = "macdaw"
-path = "D:/dev/macdaw"
+id = "example-repo"
+path = "../example-repo"
 # config_file = "harness.project.toml"   # optional override of the discovered filename
-
-# Dogfooding: register the harness as a managed project of itself (path = its repo).
-# Its per-project config is ./harness.project.toml at the harness repo root.
-[[projects]]
-id = "dev-harness"
-path = "D:/dev/dev-harness"

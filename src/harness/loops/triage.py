@@ -28,6 +28,7 @@ from harness.application.loop_runner import LoopDefinition, RunContext, StepOutc
 from harness.config.models import ProjectConfig
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter, IssueRef
+from harness.util.prompts import load_bundled_prompt
 
 TRIAGE_SCHEMA = {
     "type": "object",
@@ -61,14 +62,15 @@ DEFAULT_PROMPT = (
 
 
 def _read_prompt(project_root: Path, project: ProjectConfig) -> str:
-    """The project's triage prompt from disk, or a sane built-in fallback (so the
-    echo/fake path and tests work without a real prompt file)."""
+    """The project's triage prompt from disk, else the generic prompt bundled with the
+    package, else a terse built-in fallback (so a packaged install ships a real rubric
+    and the echo/fake path works without a prompt file)."""
     rel = project.prompts.triage
     if rel:
         path = Path(project_root) / rel
         if path.is_file():
             return path.read_text("utf-8")
-    return DEFAULT_PROMPT
+    return load_bundled_prompt("triage") or DEFAULT_PROMPT
 
 
 def _queued_block(issues: list[IssueRef]) -> str:

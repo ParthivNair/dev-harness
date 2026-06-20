@@ -89,6 +89,33 @@ def create_run_for(
     return runner.create_run(project_id=project_id, breakers=breakers_for(c.cfg, proj), data=data)
 
 
+class SchedulingDisabled(RuntimeError):
+    """The unattended driver (``watch``) was asked to run with scheduling disabled."""
+
+
+def start_research(
+    c: Container, *, project_id: str, goals: Optional[str] = None
+) -> tuple[RunRecord, RunStatus]:
+    """Create + execute one ``research`` run for PROJECT, inline.
+
+    ``goals`` overrides the project's own ``[project].goals`` (e.g. the text of a
+    ``--goals`` file); when ``None`` the loop falls back to ``project.goals``. The
+    loop only files ``harness:queued`` issues — it never opens a PR or touches code —
+    so it needs no issue/pr plumbing.
+    """
+    proj = c.registry.get(project_id)
+    if not owns(proj, c.cfg.instance):
+        raise NotOwned(
+            f"instance '{c.cfg.instance.instance_id}' does not own project "
+            f"'{project_id}' (owner: {proj.owner_instance})"
+        )
+    runner = build_runner(c, "research", proj, goals=goals)
+    record = runner.create_run(project_id=project_id, breakers=breakers_for(c.cfg, proj))
+    status = runner.run(record.run_id)
+    mark_blocked_if_aborted(c, record.run_id, status)
+    return record, status
+
+
 def execute_run(c: Container, *, loop_name: str, project_id: Optional[str], run_id: str) -> RunStatus:
     """Dispatch a CREATED/RUNNING run to its next gate or terminal state.
 
@@ -168,8 +195,28 @@ def abort_run(c: Container, *, run_id: str, reason: str = "aborted by operator")
 
 
 def tick_once(c: Container) -> TickReport:
-    """One scheduling pass (resume answered gates, then start eligible work)."""
+    """One scheduling pass (resume answered gates, then start eligible work).
+
+    A MANUAL override: ``tick`` runs even when ``[scheduling].enabled`` is false, so
+    an operator can drive a single pass by hand. Only the unattended driver
+    (``watch``) is gated by the master switch — see :func:`ensure_scheduling_enabled`.
+    """
     return build_scheduler(c).tick()
+
+
+def ensure_scheduling_enabled(c: Container) -> None:
+    """The ``[scheduling].enabled`` master switch for the UNATTENDED driver.
+
+    ``harness watch`` loops ``tick`` forever, so leaving it enabled is the explicit
+    "this machine runs autonomously" decision. Raise :class:`SchedulingDisabled`
+    (default off) so an accidental ``watch`` on a fresh install does nothing until
+    the operator opts in. ``tick`` itself stays a manual override and is NOT gated.
+    """
+    if not c.cfg.scheduling.enabled:
+        raise SchedulingDisabled(
+            "scheduling disabled; set [scheduling].enabled=true in harness.toml "
+            "to run the unattended driver (or use `harness tick` for a manual pass)"
+        )
 
 
 # --------------------------------------------------------------------------- #

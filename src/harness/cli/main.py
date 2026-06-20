@@ -16,17 +16,37 @@ from typing import Optional
 import typer
 
 from harness import operations
+from harness.application import coordination as co
+from harness.application import onboarding, preflight, schedule_install
 from harness.application.ownership import owns
 from harness.application.scheduler import TickReport
 from harness.adapters.notifier.file import FileNotifier
 from harness.adapters.registry.file_registry import FileProjectRegistry
 from harness.config.loader import find_config, load_harness_config, resolve_under
+from harness.config.models import ProjectPointer
 from harness.container import (
     Container,
     build_container,
     build_scheduler,
 )
 from harness.domain.models import RunStatus
+from harness.ports.project_registry import ProjectNotFound
+
+# The coordination state machine + severity labels a fresh target repo needs so the
+# harness:* / sev:* labels exist before the first run. Mirrors the set the loops emit.
+DEFAULT_LABELS = [
+    co.QUEUED,
+    co.IN_PROGRESS,
+    co.NEEDS_VERIFICATION,
+    co.PR_OPEN,
+    co.BLOCKED,
+    co.DONE,
+    co.CHANGES_REQUESTED,
+    co.HANDOFF,
+    "sev:high",
+    "sev:med",
+    "sev:low",
+]
 
 app = typer.Typer(no_args_is_help=True, help="dev-harness — orchestrate AI-assisted development.")
 
@@ -174,7 +194,13 @@ def watch(
     """Run tick() forever on an interval (Ctrl-C to stop) — for a machine without an OS scheduler."""
     import time
 
-    every = interval or build_container(config).cfg.scheduling.tick_interval_seconds
+    c = build_container(config)
+    try:
+        operations.ensure_scheduling_enabled(c)
+    except operations.SchedulingDisabled as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    every = interval or c.cfg.scheduling.tick_interval_seconds
     typer.echo(f"watching every {every}s (Ctrl-C to stop)")
     while True:
         _echo_tick(operations.tick_once(build_container(config)))
@@ -300,6 +326,176 @@ def config_check(config: Optional[Path] = CONFIG_OPT) -> None:
             f"min_interval={sc.min_poll_interval_seconds}s"
         )
     typer.echo("OK")
+
+
+@app.command()
+def research(
+    project: str = typer.Argument(..., help="Registered project id to research."),
+    goals: Optional[Path] = typer.Option(
+        None, "--goals", help="Path to a goals/context file (else [project].goals)."
+    ),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Research PROJECT against owner GOALS and file a prioritized backlog of
+    harness:queued issues (one focused, testable change each). Files issues only —
+    never opens a PR or touches code."""
+    c = build_container(config)
+    goals_text = goals.read_text("utf-8") if goals is not None else None
+    try:
+        record, status = operations.start_research(c, project_id=project, goals=goals_text)
+    except ProjectNotFound:
+        typer.echo(f"no such project '{project}' — run `harness add-project` first", err=True)
+        raise typer.Exit(1)
+    except operations.NotOwned as exc:
+        typer.echo(f"refusing: {exc}. Reads are fine; acting is not.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"created research run {record.run_id}")
+    rec = c.store.load(record.run_id)
+    filed = rec.data.get("filed") or []
+    skipped = rec.data.get("skipped") or []
+    if filed:
+        typer.echo(f"filed {len(filed)} issue(s): {', '.join('#' + str(n) for n in filed)}")
+    if skipped:
+        typer.echo(f"skipped {len(skipped)} duplicate(s) already in the queue")
+    if not filed and not skipped:
+        typer.echo("no findings — nothing to file")
+    _report(c, record.run_id, status)
+
+
+@app.command(name="add-project")
+def add_project(
+    repo_dir: Path = typer.Argument(..., help="Local path to the repo's working copy."),
+    repo: str = typer.Option(..., "--repo", help="GitHub 'owner/name' coordination repo."),
+    id: Optional[str] = typer.Option(
+        None, "--id", help="Project id (default: the repo directory name)."
+    ),
+    autonomous: bool = typer.Option(
+        False, "--autonomous", help="Opt this repo's publishing actions into autonomous (self-managed)."
+    ),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Onboard an arbitrary repo: detect its build/test commands, scaffold its
+    harness.project.toml, and register a pointer in harness.toml — no hand-editing."""
+    cfg_path = Path(config) if config else find_config()
+    c = build_container(config)
+    repo_abs = Path(repo_dir).resolve()
+    project_id = id or repo_abs.name or repo.split("/")[-1]
+    # The pointer path is stored relative to harness.toml's dir when possible.
+    try:
+        rel = repo_abs.relative_to(cfg_path.parent.resolve())
+        ptr_path = rel.as_posix()
+    except ValueError:
+        ptr_path = repo_abs.as_posix()
+    config_obj, toml_text = onboarding.scaffold_project(
+        project_id=project_id,
+        repo=repo,
+        owner_instance=c.cfg.instance.instance_id,
+        path=ptr_path,
+        repo_dir=repo_abs,
+        autonomous=autonomous,
+    )
+    c.registry.add_project(
+        pointer=ProjectPointer(id=project_id, path=ptr_path),
+        project_config_toml=toml_text,
+    )
+    typer.echo(f"registered project '{project_id}' -> {repo} (path: {ptr_path})")
+    typer.echo(
+        f"  build={config_obj.commands.build or '[]'} test={config_obj.commands.test or '[]'}"
+    )
+    if autonomous:
+        typer.echo("  self-managed: verify_gate/mark_pr_ready/merge_to_main -> autonomous")
+    typer.echo("  next: `harness labels-init " + project_id + "` then `harness research " + project_id + "`")
+
+
+@app.command(name="labels-init")
+def labels_init(
+    project: str = typer.Argument(..., help="Registered project id."),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Provision the harness:* state/owner + sev:* labels on PROJECT's repo so the
+    coordination state machine is well-formed before the first run."""
+    c = build_container(config)
+    try:
+        proj = c.registry.get(project)
+    except ProjectNotFound:
+        typer.echo(f"no such project '{project}' — run `harness add-project` first", err=True)
+        raise typer.Exit(1)
+    created = c.github.ensure_labels(repo=proj.repo, labels=DEFAULT_LABELS)
+    if created:
+        typer.echo(f"created {len(created)} label(s) on {proj.repo}: {', '.join(created)}")
+    else:
+        typer.echo(f"all {len(DEFAULT_LABELS)} labels already present on {proj.repo}")
+
+
+@app.command()
+def doctor(
+    config: Optional[Path] = CONFIG_OPT,
+    probe_auth: bool = typer.Option(
+        False, "--probe-auth",
+        help="Also verify the claude CLI is signed in (makes one tiny token-spending call).",
+    ),
+) -> None:
+    """Preflight: is this install actually ready to spend money? Checks the real
+    executor/GitHub adapter, a present+authenticating token, and the claude CLI.
+
+    Note: by default the claude check confirms the CLI is INSTALLED, not signed in
+    (`claude --version` exits 0 when signed out). Pass --probe-auth to verify login.
+    """
+    c = build_container(config)
+    report = preflight.run_doctor(c, probe_auth=probe_auth)
+    typer.echo(f"executor real:      {report.executor_real}")
+    typer.echo(f"github real:        {report.github_real}")
+    typer.echo(f"github token:       {'present' if report.github_token_present else 'missing'}")
+    typer.echo(f"github whoami:      {report.github_whoami or '-'}")
+    typer.echo(f"claude installed:   {'yes' if report.claude_ok else 'NO'} ({report.claude_detail})")
+    if report.claude_authenticated is None:
+        typer.echo("claude login:       not checked (pass --probe-auth; the first real run also confirms it)")
+    else:
+        typer.echo(
+            f"claude login:       {'signed in' if report.claude_authenticated else 'NOT signed in'}"
+            f" ({report.claude_auth_detail})"
+        )
+    if report.issues:
+        typer.echo("")
+        typer.echo("issues:")
+        for issue in report.issues:
+            typer.echo(f"  - {issue}")
+    typer.echo("")
+    typer.echo("READY" if report.ok else "NOT READY")
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+@app.command(name="install-schedule")
+def install_schedule_cmd(
+    interval: Optional[int] = typer.Option(
+        None, "--interval", help="Seconds between ticks (default: scheduling.tick_interval_seconds)."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually install the OS schedule (default: dry run)."
+    ),
+    config: Optional[Path] = CONFIG_OPT,
+) -> None:
+    """Register `harness tick` with the OS scheduler (Task Scheduler / launchd /
+    cron) so the harness runs unattended. Dry run by default — pass --apply to install."""
+    cfg_path = Path(config) if config else find_config()
+    c = build_container(config)
+    result = schedule_install.install_schedule(
+        interval_seconds=interval or c.cfg.scheduling.tick_interval_seconds,
+        harness_cmd="harness tick",
+        working_dir=str(cfg_path.parent.resolve()),
+        dry_run=not apply,
+    )
+    typer.echo(f"platform: {result.platform}  task: {result.task_name}")
+    typer.echo("")
+    typer.echo("schedule:")
+    typer.echo(result.schedule_text)
+    typer.echo("")
+    typer.echo(f"command: {result.command}")
+    for line in result.instructions:
+        typer.echo(f"  {line}")
+    typer.echo("")
+    typer.echo(f"applied: {result.applied}")
 
 
 if __name__ == "__main__":

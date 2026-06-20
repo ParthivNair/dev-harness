@@ -36,6 +36,7 @@ from harness.loops.arch_review import build_arch_review_loop
 from harness.loops.demo import build_demo_loop
 from harness.loops.dev_task import build_dev_loop
 from harness.loops.pr_review import build_pr_review_loop
+from harness.loops.research import build_research_loop
 from harness.loops.triage import build_triage_loop
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
@@ -44,7 +45,8 @@ from harness.ports.project_registry import ProjectRegistry
 
 
 class UnknownLoop(ValueError):
-    """A loop name with no builder (not 'demo', 'dev_task', 'arch_review', or 'triage')."""
+    """A loop name with no builder (not 'demo', 'dev_task', 'arch_review',
+    'triage', 'pr_review', or 'research')."""
 
 
 @dataclass
@@ -66,7 +68,10 @@ def build_container(
     cfg = load_harness_config(path)
     base_dir = path.parent
 
-    registry = FileProjectRegistry(cfg.projects, base_dir)
+    # Pass the ACTUAL loaded config path (not just base_dir) so the write side
+    # (add_project) appends the pointer to the file that was loaded — e.g. a
+    # non-default `--config custom.toml` — instead of a hardcoded harness.toml.
+    registry = FileProjectRegistry(cfg.projects, base_dir, instance_config_path=path)
     store = AtomicJsonRunStore(resolve_under(base_dir, cfg.state_store.root))
 
     selection = notifier_override or cfg.notifier.selection
@@ -100,11 +105,17 @@ def build_container(
     else:
         github = PyGithubAdapter(token=cfg.github.token, api_base=cfg.github.api_base)
 
-    if cfg.github.use_in_memory_fake:
-        executor: Executor = EchoExecutor()
-    else:
+    # Choose the executor INDEPENDENTLY of the GitHub adapter so real-Claude +
+    # fake-GitHub (a token-spending dry run that writes nothing to GitHub) and the
+    # reverse are both expressible. execution.mode="auto" (the default) preserves
+    # the legacy coupling exactly: the executor follows github.use_in_memory_fake.
+    mode = cfg.execution.mode
+    use_real_executor = mode == "real" or (mode == "auto" and not cfg.github.use_in_memory_fake)
+    if use_real_executor:
         roots = {p.id: resolve_under(base_dir, p.path) for p in cfg.projects}
-        executor = SubprocessExecutor(project_root_resolver=lambda pid: roots[pid])
+        executor: Executor = SubprocessExecutor(project_root_resolver=lambda pid: roots[pid])
+    else:
+        executor = EchoExecutor()
 
     return Container(
         cfg=cfg,
@@ -138,7 +149,13 @@ def breakers_for(cfg: HarnessConfig, project: ProjectConfig) -> BreakerState:
     return BreakerState(max_iterations=cb.max_iterations, budget_ceiling_usd=cb.spend_ceiling_usd)
 
 
-def build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig]) -> LoopRunner:
+def build_runner(
+    c: Container,
+    loop_name: str,
+    project: Optional[ProjectConfig],
+    *,
+    goals: Optional[str] = None,
+) -> LoopRunner:
     if loop_name == "demo":
         if project is None:
             raise UnknownLoop("the demo loop needs a project")
@@ -192,10 +209,22 @@ def build_runner(c: Container, loop_name: str, project: Optional[ProjectConfig])
             project_root=project_root(c, project.id),
             artifacts_dir=c.store.root / "artifacts",
         )
+    elif loop_name == "research":
+        if project is None:
+            raise UnknownLoop("the research loop needs a project")
+        loop = build_research_loop(
+            executor=c.executor,
+            github=c.github,
+            guard=_guard_for(c, project),
+            project=project,
+            project_root=project_root(c, project.id),
+            # The `--goals <file>` override wins; else the project's own [project].goals.
+            goals=goals if goals is not None else project.goals,
+        )
     else:
         raise UnknownLoop(
             f"unknown loop '{loop_name}' "
-            "(try 'demo', 'dev_task', 'arch_review', 'triage', or 'pr_review')"
+            "(try 'demo', 'dev_task', 'arch_review', 'triage', 'pr_review', or 'research')"
         )
     return LoopRunner(loop, c.store, c.notifier)
 
