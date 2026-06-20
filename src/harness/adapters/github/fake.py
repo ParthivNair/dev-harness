@@ -34,6 +34,27 @@ class InMemoryGitHub:
         self._checks: dict[tuple[str, int], ChecksState] = {}
         self._reviews: dict[tuple[str, int], list[tuple[ReviewEvent, str]]] = {}
         self._merges: dict[tuple[str, int], str] = {}  # (repo, number) -> merge method used
+        # per-repo label catalogue (name -> color), for ensure_labels idempotency.
+        self._labels: dict[str, dict[str, str]] = {}
+        self._login = "harness-bot"  # stub authenticated login
+
+    # ---- identity / setup ----
+    def whoami(self) -> Optional[str]:
+        return self._login
+
+    def create_label(
+        self, *, repo: str, name: str, color: str = "", description: str = ""
+    ) -> None:
+        self._labels.setdefault(repo, {})[name] = color
+
+    def ensure_labels(self, *, repo: str, labels: list[str]) -> list[str]:
+        existing = self._labels.setdefault(repo, {})
+        created = []
+        for name in labels:
+            if name not in existing:
+                existing[name] = ""
+                created.append(name)
+        return created
 
     # ---- reads ----
     def list_issues(
@@ -224,3 +245,7 @@ class InMemoryGitHub:
 
     def merge_method_for(self, *, repo: str, number: int) -> Optional[str]:
         return self._merges.get((repo, number))
+
+    def labels_on(self, *, repo: str) -> set[str]:
+        """The set of label names provisioned on ``repo`` (test assertions)."""
+        return set(self._labels.get(repo, {}))

@@ -38,6 +38,7 @@ from harness.domain.models import TERMINAL_STATUSES, RunRecord
 from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
 from harness.ports.run_store import RunStore
+from harness.util.prompts import load_bundled_prompt
 
 DEV_ANSWER_SCHEMA = {
     "type": "object",
@@ -59,14 +60,15 @@ _MAX_LOG = 4000  # cap failure logs fed back into the next prompt
 
 
 def _read_prompt(project_root: Path, project: ProjectConfig) -> str:
-    """The project's dev_task prompt from disk, or a sane built-in fallback (so the
-    echo/fake path and tests work without a real prompt file)."""
+    """The project's dev_task prompt from disk, else the generic prompt bundled with
+    the package, else a terse built-in fallback (so the echo/fake path and tests work
+    without a real prompt file, and a packaged install ships real prompts)."""
     rel = project.prompts.dev_task
     if rel:
         path = Path(project_root) / rel
         if path.is_file():
             return path.read_text("utf-8")
-    return DEFAULT_DEV_PROMPT
+    return load_bundled_prompt("dev_task") or DEFAULT_DEV_PROMPT
 
 
 def _compose_prompt(base_prompt: str, issue_title: str, issue_body: str,

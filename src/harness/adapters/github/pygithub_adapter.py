@@ -75,6 +75,47 @@ class PyGithubAdapter:
     def _repo(self, repo: str) -> Any:
         return self._gh.get_repo(repo)
 
+    # ---- identity / setup ----
+    def whoami(self) -> Optional[str]:
+        """The authenticated login, or None if the token is missing/invalid.
+
+        A cheap one-call auth probe. Any failure (bad token, network, scope) is
+        swallowed into None so the preflight doctor can report "not ready" rather
+        than crash — the same fail-soft contract the port documents."""
+        from github import GithubException  # lazy import
+
+        try:
+            return self._gh.get_user().login
+        except (GithubException, Exception):  # noqa: BLE001 — a probe never raises
+            return None
+
+    def create_label(
+        self, *, repo: str, name: str, color: str = "", description: str = ""
+    ) -> None:
+        # GitHub requires a 6-hex colour with no leading '#'; "" picks a neutral grey.
+        self._repo(repo).create_label(
+            name=name, color=(color or "ededed").lstrip("#"), description=description
+        )
+
+    def ensure_labels(self, *, repo: str, labels: list[str]) -> list[str]:
+        """Create any missing labels; return the names actually created (idempotent)."""
+        from github import GithubException  # lazy import
+
+        gh_repo = self._repo(repo)
+        existing = {label.name for label in gh_repo.get_labels()}
+        created = []
+        for name in labels:
+            if name in existing:
+                continue
+            try:
+                self.create_label(repo=repo, name=name)
+                created.append(name)
+            except GithubException:
+                # A concurrent provisioner (the other machine) may have just created
+                # it — a 422 "already_exists" race is benign, not a failure.
+                pass
+        return created
+
     # ---- reads ----
     def list_issues(
         self,

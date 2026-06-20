@@ -1,14 +1,18 @@
-"""The architecture-review loop — the harness's "tech lead who writes tickets".
+"""The research loop — the harness's "product researcher who writes the backlog".
 
-    scan -> assess -> file_findings -> finish     (findings)
-    scan -> assess -> finish                       (no action needed)
+    scan -> assess -> file_findings -> finish     (issues filed)
+    scan -> assess -> finish                       (nothing worth filing)
 
-Bounded and rubric-driven. It asks Claude for *structured* findings against the
-project's ``arch_review`` rubric (a JSON-Schema-constrained call), then files a
-``harness:queued`` issue per finding — which becomes the dev loop's work queue.
+Sibling of :mod:`harness.loops.arch_review`, but goals-driven rather than
+rubric-driven. Where arch_review measures the code against a fixed architecture
+rubric, research takes the OWNER'S GOALS/CONTEXT (the ``goals`` argument) and asks
+Claude to research THIS repo and emit a prioritized backlog of small,
+independently-shippable, TESTABLE issues. It files a ``harness:queued`` issue per
+finding — which becomes the dev loop's work queue.
+
 It never opens PRs or touches code: its blast radius is "creates issues", the
 safest write tier. Findings are deduped by title against the open queue so a
-repeated review never spams duplicates.
+repeated research pass never spams duplicates.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from harness.ports.executor import Executor
 from harness.ports.github import GitHubAdapter
 from harness.util.prompts import load_bundled_prompt
 
-ARCH_FINDINGS_SCHEMA = {
+RESEARCH_SCHEMA = {
     "type": "object",
     "properties": {
         "findings": {
@@ -34,9 +38,9 @@ ARCH_FINDINGS_SCHEMA = {
                 "properties": {
                     "title": {"type": "string"},
                     "severity": {"enum": ["low", "med", "high"]},
-                    "rationale": {"type": "string"},
+                    "body": {"type": "string"},
                 },
-                "required": ["title", "severity", "rationale"],
+                "required": ["title", "severity", "body"],
                 "additionalProperties": False,
             },
         }
@@ -45,24 +49,37 @@ ARCH_FINDINGS_SCHEMA = {
     "additionalProperties": False,
 }
 
-DEFAULT_RUBRIC = (
-    "Review this codebase against its architecture rubric. Report concrete, "
-    "actionable findings only (no praise, no speculation). For each, give a short "
-    "title, a severity (low|med|high), and a one-paragraph rationale. If nothing "
-    "needs action, return an empty findings list."
+# Inline fallback used when the bundled ``research`` prompt is missing (so the
+# echo/fake path and tests work without the packaged template). Mirrors the shape
+# of prompts/research.md: research first, one focused change per issue, testable
+# acceptance criteria, dedupe, no placeholders — with a {{goals}} placeholder.
+DEFAULT_PROMPT = (
+    "Research this repository and file a prioritized backlog of small, well-scoped "
+    "issues — one focused change each — for an autonomous dev loop to claim and "
+    "implement. Do not implement anything in this pass.\n\n"
+    "## Goals & context\n\n{{goals}}\n\n"
+    "Each issue must be a single, independently-shippable change with TESTABLE "
+    "acceptance criteria a human can verify. For each, give a short imperative title, "
+    "a severity (low|med|high), and a body with what/why + acceptance criteria + file "
+    "pointers. Research first (README/docs, TODO/FIXME, thin spots, existing issues); "
+    "dedupe against the current backlog; no placeholder issues. If nothing is worth "
+    "filing, return an empty findings list."
+)
+
+# Used when ``goals`` is empty — a generic "find the most valuable improvements"
+# brief so the loop still produces a sensible backlog with no owner context.
+GENERIC_GOALS = (
+    "(No explicit goals were provided.) Find the most valuable improvements for this "
+    "repository: correctness, missing tests, rough edges, and obvious gaps."
 )
 
 
-def _read_rubric(project_root: Path, project: ProjectConfig) -> str:
-    """The project's arch_review rubric from disk, else the generic rubric bundled with
-    the package, else a terse built-in fallback (so a packaged install ships a real
-    rubric and the echo/fake path works without a prompt file)."""
-    rel = project.prompts.arch_review
-    if rel:
-        path = Path(project_root) / rel
-        if path.is_file():
-            return path.read_text("utf-8")
-    return load_bundled_prompt("arch_review") or DEFAULT_RUBRIC
+def _build_prompt(goals: str) -> str:
+    """The bundled ``research`` template with ``{{goals}}`` filled in, or the inline
+    default if the template is unavailable. An empty ``goals`` falls back to a
+    generic 'find the most valuable improvements' brief."""
+    template = load_bundled_prompt("research") or DEFAULT_PROMPT
+    return template.replace("{{goals}}", goals.strip() or GENERIC_GOALS)
 
 
 def _parse_findings(result_text: str) -> list[dict]:
@@ -78,20 +95,21 @@ def _parse_findings(result_text: str) -> list[dict]:
     return findings if isinstance(findings, list) else []
 
 
-def build_arch_review_loop(
+def build_research_loop(
     *,
     executor: Executor,
     github: GitHubAdapter,
     guard: ActionGuard,
     project: ProjectConfig,
     project_root: Path,
+    goals: str,
 ) -> LoopDefinition:
-    rubric = _read_rubric(project_root, project)
+    prompt = _build_prompt(goals)
     repo = project.repo
 
     def scan(ctx: RunContext) -> StepOutcome:
         result = executor.run_claude_task(
-            project=project, prompt=rubric, json_schema=ARCH_FINDINGS_SCHEMA
+            project=project, prompt=prompt, json_schema=RESEARCH_SCHEMA
         )
         ctx.record_cost(result.total_cost_usd, result.input_tokens, result.output_tokens)
         findings = _parse_findings(result.result_text)
@@ -109,7 +127,11 @@ def build_arch_review_loop(
 
     def file_findings(ctx: RunContext) -> StepOutcome:
         findings = ctx.data.get("findings") or []
-        # Dedupe by title against the open queue so repeated reviews don't pile up.
+        # Provision the labels we apply, so research is self-sufficient and works even
+        # if `labels-init` wasn't run first (idempotent, order-independent). The full
+        # coordination set is still provisioned by `labels-init`; here we only need ours.
+        github.ensure_labels(repo=repo, labels=[co.QUEUED, "sev:high", "sev:med", "sev:low"])
+        # Dedupe by title against the open queue so repeated research doesn't pile up.
         existing = {i.title for i in github.list_issues(repo=repo, state="open", labels=[co.QUEUED])}
         filed: list[int] = []
         skipped: list[str] = []
@@ -123,7 +145,7 @@ def build_arch_review_loop(
             issue = github.create_issue(
                 repo=repo,
                 title=title,
-                body=f.get("rationale", ""),
+                body=f.get("body", ""),
                 labels=[co.QUEUED, f"sev:{sev}"],
             )
             filed.append(issue.number)
@@ -138,7 +160,7 @@ def build_arch_review_loop(
         return StepOutcome(next_step=None, output={"done": True})
 
     return LoopDefinition(
-        name="arch_review",
+        name="research",
         start_step="scan",
         steps={"scan": scan, "assess": assess, "file_findings": file_findings, "finish": finish},
     )

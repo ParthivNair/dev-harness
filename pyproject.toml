@@ -29,6 +29,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/harness"]
+# Ship the bundled agent prompts (src/harness/prompts/*.md) as package data so a
+# pip-installed wheel can load them via importlib.resources('harness.prompts').
+# harness.prompts is a real subpackage (has __init__.py), so hatchling includes the
+# package dir; `artifacts` makes sure the non-Python .md files travel with it (the
+# default sdist/wheel filter would otherwise treat *.md as non-source). No
+# force-include — that would double-add prompts/__init__.py.
+artifacts = ["src/harness/prompts/*.md"]
 
 [dependency-groups]
 dev = [

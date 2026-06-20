@@ -85,6 +85,31 @@ class PullRef:
 
 @runtime_checkable
 class GitHubAdapter(Protocol):
+    # ---- IDENTITY / SETUP (cheap auth probe + one-time label provisioning) ----
+    def whoami(self) -> Optional[str]:
+        """The authenticated login, or ``None`` if the token is missing/invalid.
+
+        A cheap auth/identity probe — the preflight ``doctor`` calls it to confirm
+        the configured token actually reaches GitHub before a run spends money. Must
+        NEVER raise on a bad token; a failed authentication returns ``None``."""
+
+    def create_label(
+        self, *, repo: str, name: str, color: str = "", description: str = ""
+    ) -> None:
+        """Create one label on ``repo`` (idempotent at the caller's discretion).
+
+        ``color`` is a 6-hex-digit GitHub colour with no leading ``#`` ("" => a
+        default). Used by :meth:`ensure_labels` to provision the coordination state
+        machine on a fresh target repo."""
+
+    def ensure_labels(self, *, repo: str, labels: list[str]) -> list[str]:
+        """Create any of ``labels`` not already present; return the ones created.
+
+        Idempotent — labels that already exist are left untouched and omitted from
+        the return. Provisions the ``harness:*`` state/owner labels and the ``sev:*``
+        severity labels so the coordination state machine is well-formed on a target
+        repo this install has not run against before."""
+
     # ---- READS (always allowed, even for projects this install does not own) ----
     def list_issues(
         self,

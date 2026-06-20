@@ -55,6 +55,23 @@ class GitHubConfig(BaseModel):
     token: Optional[str] = Field(default=None, repr=False)
 
 
+class ExecutionConfig(BaseModel):
+    """Selects the code-generation executor INDEPENDENTLY of the GitHub adapter.
+
+    Historically the executor was chosen off ``github.use_in_memory_fake`` (fake
+    GitHub => echo executor, real GitHub => subprocess), so you could not mix a real
+    Claude run with a fake GitHub (a safe "dry run": spend tokens, write nothing to
+    GitHub) or vice-versa. This section breaks that coupling.
+
+    ``mode`` defaults to ``"auto"``, which preserves the legacy behaviour exactly:
+    the executor follows ``github.use_in_memory_fake`` (fake => echo, real =>
+    subprocess). Set it to ``"real"`` to force :class:`SubprocessExecutor` (real
+    Claude) or ``"echo"`` to force :class:`EchoExecutor` regardless of the GitHub
+    adapter choice."""
+
+    mode: Literal["auto", "real", "echo"] = "auto"
+
+
 class StateStoreConfig(BaseModel):
     backend: str = "json"          # "json" (M1) | "sqlite" (later)
     root: str = ".harness"         # relative to the harness.toml directory unless absolute
@@ -124,6 +141,7 @@ class HarnessConfig(BaseModel):
     schema_version: int = 1
     instance: InstanceInfo
     github: GitHubConfig = Field(default_factory=GitHubConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     state_store: StateStoreConfig = Field(default_factory=StateStoreConfig)
     notifier: NotifierConfig = Field(default_factory=NotifierConfig)
     autonomy: dict[str, AutonomyTier] = Field(default_factory=dict)
@@ -195,6 +213,11 @@ class ProjectConfig(BaseModel):
     repo: str = ""
     owner_instance: str
     description: str = ""
+    # Free-text owner goals/context for the `research` loop: what this repo is for
+    # and what kinds of improvements matter. Fed to Claude (via {{goals}}) when the
+    # research loop scopes a backlog. Empty => a generic "find the most valuable
+    # improvements" brief. A `harness research <p> --goals <file>` overrides it.
+    goals: str = ""
     commands: ProjectCommands = Field(default_factory=ProjectCommands)
     prompts: PromptSet = Field(default_factory=PromptSet)
     claude: ClaudeConfig = Field(default_factory=ClaudeConfig)

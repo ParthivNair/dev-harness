@@ -46,6 +46,7 @@ from harness.application.loop_runner import LoopDefinition, RunContext, StepOutc
 from harness.config.models import ProjectConfig
 from harness.ports.executor import Executor
 from harness.ports.github import ChecksState, GitHubAdapter, PRState, ReviewEvent
+from harness.util.prompts import load_bundled_prompt
 
 PR_REVIEW_SCHEMA = {
     "type": "object",
@@ -91,12 +92,15 @@ _MAX_DIFF = 30_000  # cap the diff fed into the review prompt
 
 
 def _read_prompt(project_root: Path, project: ProjectConfig) -> str:
+    """The project's pr_review prompt from disk, else the generic prompt bundled with
+    the package, else a terse built-in fallback (so a packaged install ships a real
+    reviewer rubric and the echo/fake path works without a prompt file)."""
     rel = project.prompts.pr_review
     if rel:
         path = Path(project_root) / rel
         if path.is_file():
             return path.read_text("utf-8")
-    return DEFAULT_REVIEW_PROMPT
+    return load_bundled_prompt("pr_review") or DEFAULT_REVIEW_PROMPT
 
 
 def _compose_prompt(base_prompt: str, pr_title: str, diff: str) -> str:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from harness.config.models import ProjectConfig
+from harness.config.models import ProjectConfig, ProjectPointer
 
 
 class ProjectNotFound(KeyError):
@@ -27,3 +27,11 @@ class ProjectRegistry(Protocol):
 
     def reload(self) -> None:
         """Re-read project configs from disk."""
+
+    def add_project(
+        self, *, pointer: ProjectPointer, project_config_toml: str | None = None
+    ) -> None:
+        """Register a new project: append ``pointer`` to the instance config and,
+        if ``project_config_toml`` is given, write it as the target repo's
+        ``harness.project.toml``. Idempotent on the pointer id (re-adding a known
+        id is a no-op) and reloads so the new project is immediately visible."""
